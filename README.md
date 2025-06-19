@@ -1,17 +1,16 @@
 # Telephone Fraud Detection API
 
-This repository contains notebooks, trained models, and logs for a system that detects telephone fraud based on call patterns. The API is implemented with FastAPI and can be run by converting the notebook `Notebookes/api_modelo.ipynb` to a Python script.
+This repository contains notebooks, trained models, and logs for a system that detects telephone fraud based on call patterns.  The API code now lives under `src/api_app/` and can be run directly with Uvicorn.
 
 ## Running the API
 
-1. Convert the notebook to a script using nbconvert:
+1. Install the package in editable mode (optional):
    ```bash
-   jupyter nbconvert --to script Notebookes/api_modelo.ipynb
+   pip install -e .
    ```
-   This generates `api_modelo.py`.
 2. Start the server with `uvicorn`:
    ```bash
-   uvicorn api_modelo:app --reload
+   uvicorn api_app.main:app --reload
    ```
    The API will be available at `http://localhost:8000`.
 

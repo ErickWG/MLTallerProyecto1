@@ -1,0 +1,11 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "api_app"
+version = "0.1.0"
+packages = ["api_app"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
