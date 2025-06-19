@@ -18,6 +18,7 @@ import pandas as pd
 import numpy as np
 import pickle
 import os
+from dotenv import load_dotenv
 from pathlib import Path
 import json
 import asyncio
@@ -35,13 +36,15 @@ logger = logging.getLogger(__name__)
 
 print("✅ Librerías importadas para API")
 
+# Load environment variables from a .env file if present
+load_dotenv()
+
 
 # In[2]:
 
 
 import oracledb
 from datetime import datetime
-import os
 from typing import Optional
 from contextlib import contextmanager
 import json
@@ -53,11 +56,11 @@ import json
 # In[3]:
 
 
-# Configuración de Oracle (ajusta según tu ambiente)
+# Configuración de Oracle obtenida desde variables de entorno
 ORACLE_CONFIG = {
-    "user": "SYSTEM",
-    "password": "erick710132",
-    "dsn": "localhost:1521/xe",  # Formato: host:port/service_name
+    "user": os.getenv("ORACLE_USER", "SYSTEM"),
+    "password": os.getenv("ORACLE_PASSWORD", "erick710132"),
+    "dsn": os.getenv("ORACLE_DSN", "localhost:1521/xe"),  # Formato: host:port/service_name
     # Alternativa con TNS:
     # "dsn": "XEPDB1"  # Si usas tnsnames.ora
 }

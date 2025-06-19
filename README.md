@@ -26,12 +26,12 @@ This repository contains notebooks, trained models, and logs for a system that d
 
 1. Install dependencies (Python 3.8+ recommended):
    ```bash
-   pip install fastapi uvicorn pandas numpy scikit-learn oracledb
+   pip install fastapi uvicorn pandas numpy scikit-learn oracledb python-dotenv
    ```
-2. (Optional) Set environment variables for Oracle connection if your configuration differs from the defaults inside the notebook/script:
+2. Create a `.env` file using `.env.example` and set your Oracle connection variables:
    - `ORACLE_USER`
    - `ORACLE_PASSWORD`
    - `ORACLE_DSN`
 
-3. Run the API as described above.
+3. Run the API as described above. The application will load the variables from the `.env` file automatically.
 
