@@ -867,7 +867,7 @@ async def obtener_estadisticas_modelo():
     return EstadisticasModelo(
         fecha_entrenamiento=ml.config.get('fecha_entrenamiento', 'No disponible'),
         fecha_ultima_actualizacion=ml.config.get('fecha_ultima_actualizacion'),
-        ml.umbral_global=ml.umbral_global,
+        umbral_global=ml.umbral_global,
         n_trees=ml.config.get('n_trees', 0),
         tree_height=ml.config.get('tree_height', 0),
         registros_entrenamiento=ml.config.get('registros_entrenamiento', 0),
@@ -880,8 +880,6 @@ async def actualizar_umbral(configuracion: ConfiguracionUmbral):
     """
     Actualiza el umbral de detección de anomalías
     """
-    global ml.umbral_global
-
     if not ml.modelo:
         raise HTTPException(status_code=503, detail="Modelo no disponible")
 
