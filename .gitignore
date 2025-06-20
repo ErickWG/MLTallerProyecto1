@@ -1,3 +1,11 @@
 # Archivos de configuración local
 .env
 *.env
+# Modelos y datos generados
+*.pkl
+*.csv
+*.ipynb
+Resultados/
+Resultados_API/
+Logs_API/
+Modelos/
