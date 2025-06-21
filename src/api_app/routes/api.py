@@ -20,10 +20,12 @@ from ..models.schemas import (
     TipoAnomalia,
 )
 from ..models import ml
-from ..database.oracle import registrar_lote_procesamiento, guardar_anomalias_oracle
+from ..database.oracle import (
+    registrar_lote_procesamiento,
+    guardar_anomalias_oracle,
+    get_oracle_connection,
+)
 from ..database import oracle
-oracle_pool = oracle.oracle_pool
-get_oracle_connection = oracle.get_oracle_connection
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -159,7 +161,7 @@ async def scoring_batch(file: UploadFile = File(...)):
         df_resultados.to_csv(archivo_salida, index=False)
 
         # NUEVO: Guardar en Oracle si está disponible
-        if oracle_pool:
+        if oracle.oracle_pool:
             try:
                 # Registrar lote
                 lote_id = registrar_lote_procesamiento(
@@ -193,7 +195,7 @@ async def scoring_batch(file: UploadFile = File(...)):
             "archivo_resultados": os.path.basename(archivo_salida),
             "lote_id": lote_id,
             "timestamp": datetime.now(),
-            "guardado_oracle": oracle_pool is not None
+            "guardado_oracle": oracle.oracle_pool is not None
         }
 
     except Exception as e:
@@ -202,7 +204,7 @@ async def scoring_batch(file: UploadFile = File(...)):
             os.remove(temp_file)
 
         # Registrar error en Oracle si es posible
-        if oracle_pool and lote_id is None:
+        if oracle.oracle_pool and lote_id is None:
             try:
                 with get_oracle_connection() as conn:
                     cursor = conn.cursor()
@@ -234,7 +236,7 @@ async def consultar_alertas(
     """
     Consulta las alertas guardadas en Oracle con filtros opcionales
     """
-    if not oracle_pool:
+    if not oracle.oracle_pool:
         raise HTTPException(status_code=503, detail="Oracle no disponible")
 
     try:
@@ -301,7 +303,7 @@ async def estadisticas_alertas(
     """
     Obtiene estadísticas de las alertas en un rango de fechas
     """
-    if not oracle_pool:
+    if not oracle.oracle_pool:
         raise HTTPException(status_code=503, detail="Oracle no disponible")
 
     try:
@@ -395,7 +397,7 @@ async def historial_lotes(limite: int = Query(50, description="Número de lotes 
     """
     Obtiene el historial de lotes procesados
     """
-    if not oracle_pool:
+    if not oracle.oracle_pool:
         raise HTTPException(status_code=503, detail="Oracle no disponible")
 
     try:
@@ -606,7 +608,7 @@ def procesar_actualizacion_diaria(archivo_path: str, df: pd.DataFrame):
         logger.info(f"Iniciando actualización diaria con {len(df)} registros del día")
         
         # Registrar inicio en Oracle
-        if oracle_pool:
+        if oracle.oracle_pool:
             id_actualizacion = registrar_inicio_actualizacion_diaria(
                 archivo_path, len(df), estado_inicial
             )
@@ -794,7 +796,7 @@ def procesar_actualizacion_diaria(archivo_path: str, df: pd.DataFrame):
         tiempo_procesamiento = (tiempo_fin - tiempo_inicio).total_seconds()
         
         # Actualizar registro en Oracle
-        if oracle_pool and id_actualizacion:
+        if oracle.oracle_pool and id_actualizacion:
             actualizar_fin_actualizacion_diaria(
                 id_actualizacion=id_actualizacion,
                 umbral_nuevo=umbral_nuevo,
@@ -832,7 +834,7 @@ def procesar_actualizacion_diaria(archivo_path: str, df: pd.DataFrame):
         logger.error(f"Error en actualización diaria: {str(e)}")
         
         # Actualizar registro de error en Oracle
-        if oracle_pool and id_actualizacion:
+        if oracle.oracle_pool and id_actualizacion:
             try:
                 with get_oracle_connection() as conn:
                     cursor = conn.cursor()
@@ -896,7 +898,7 @@ async def actualizar_umbral(configuracion: ConfiguracionUmbral):
             pickle.dump(ml.config, f)
 
         # NUEVO: Guardar en Oracle si está disponible
-        if oracle_pool:
+        if oracle.oracle_pool:
             try:
                 with get_oracle_connection() as conn:
                     cursor = conn.cursor()
@@ -934,7 +936,7 @@ async def actualizar_umbral(configuracion: ConfiguracionUmbral):
             "umbral_anterior": umbral_anterior,
             "umbral_nuevo": ml.umbral_global,
             "timestamp": datetime.now(),
-            "guardado_oracle": oracle_pool is not None
+            "guardado_oracle": oracle.oracle_pool is not None
         }
 
     except Exception as e:
@@ -964,7 +966,7 @@ async def historial_umbrales(dias: int = Query(30, description="Días de histori
     """
     Muestra la evolución del umbral en los últimos días
     """
-    if not oracle_pool:
+    if not oracle.oracle_pool:
         # Si no hay Oracle, buscar en archivos de backup
         backups = []
         for archivo in os.listdir(ml.MODELS_PATH):
@@ -1431,7 +1433,7 @@ async def historial_actualizacion(
     """
     Obtiene el historial de aprendizajes incrementales realizados
     """
-    if not oracle_pool:
+    if not oracle.oracle_pool:
         raise HTTPException(status_code=503, detail="Oracle no disponible")
 
     try:
@@ -1483,7 +1485,7 @@ async def detalle_aprendizaje(id_aprendizaje: int):
     """
     Obtiene el detalle completo de un aprendizaje incremental específico
     """
-    if not oracle_pool:
+    if not oracle.oracle_pool:
         raise HTTPException(status_code=503, detail="Oracle no disponible")
 
     try:
@@ -1530,7 +1532,7 @@ async def estadisticas_evolucion():
     """
     Muestra la evolución del modelo a través de los aprendizajes incrementales
     """
-    if not oracle_pool:
+    if not oracle.oracle_pool:
         raise HTTPException(status_code=503, detail="Oracle no disponible")
 
     try:
