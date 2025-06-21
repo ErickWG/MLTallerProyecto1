@@ -1,4 +1,4 @@
-from fastapi import APIRouter, File, UploadFile, HTTPException, BackgroundTasks, Query, WebSocket
+from fastapi import APIRouter, File, UploadFile, HTTPException, BackgroundTasks, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, FileResponse
 from typing import Optional
 from datetime import datetime, timedelta
@@ -20,10 +20,13 @@ from ..models.schemas import (
     TipoAnomalia,
 )
 from ..models import ml
-from ..database.oracle import registrar_lote_procesamiento, guardar_anomalias_oracle
+from ..database.oracle import (
+    registrar_lote_procesamiento,
+    guardar_anomalias_oracle,
+    get_oracle_connection,
+)
 from ..database import oracle
-oracle_pool = oracle.oracle_pool
-get_oracle_connection = oracle.get_oracle_connection
+
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -159,7 +162,7 @@ async def scoring_batch(file: UploadFile = File(...)):
         df_resultados.to_csv(archivo_salida, index=False)
 
         # NUEVO: Guardar en Oracle si está disponible
-        if oracle_pool:
+        if oracle.oracle_pool:
             try:
                 # Registrar lote
                 lote_id = registrar_lote_procesamiento(
@@ -193,7 +196,7 @@ async def scoring_batch(file: UploadFile = File(...)):
             "archivo_resultados": os.path.basename(archivo_salida),
             "lote_id": lote_id,
             "timestamp": datetime.now(),
-            "guardado_oracle": oracle_pool is not None
+            "guardado_oracle": oracle.oracle_pool is not None
         }
 
     except Exception as e:
@@ -202,7 +205,7 @@ async def scoring_batch(file: UploadFile = File(...)):
             os.remove(temp_file)
 
         # Registrar error en Oracle si es posible
-        if oracle_pool and lote_id is None:
+        if oracle.oracle_pool and lote_id is None:
             try:
                 with get_oracle_connection() as conn:
                     cursor = conn.cursor()
@@ -234,7 +237,7 @@ async def consultar_alertas(
     """
     Consulta las alertas guardadas en Oracle con filtros opcionales
     """
-    if not oracle_pool:
+    if not oracle.oracle_pool:
         raise HTTPException(status_code=503, detail="Oracle no disponible")
 
     try:
@@ -301,7 +304,7 @@ async def estadisticas_alertas(
     """
     Obtiene estadísticas de las alertas en un rango de fechas
     """
-    if not oracle_pool:
+    if not oracle.oracle_pool:
         raise HTTPException(status_code=503, detail="Oracle no disponible")
 
     try:
@@ -395,8 +398,7 @@ async def historial_lotes(limite: int = Query(50, description="Número de lotes 
     """
     Obtiene el historial de lotes procesados
     """
-    if not oracle_pool:
-        raise HTTPException(status_code=503, detail="Oracle no disponible")
+
 
     try:
         with get_oracle_connection() as conn:
@@ -467,7 +469,7 @@ def calcular_umbral_adaptativo(modelo, scaler, df_muestra, stats_dict):
             'N_DESTINOS': row['N_DESTINOS']
         }
 
-        features = crear_features_contextualizadas_mejorada(row_dict, ml.stats_dict)
+        features = ml.crear_features_contextualizadas_mejorada(row_dict, ml.stats_dict)
         features_scaled = scaler.transform_one(features)
         score = modelo.score_one(features_scaled)
         scores.append(score)
@@ -487,16 +489,16 @@ def registrar_inicio_actualizacion_diaria(archivo_path, total_registros, estado_
         except:
             paises_en_archivo = 0
 
-        id_var = cursor.var(oracledb.NUMBER)
+        id_var = cursor.var(oracle.NUMBER)
 
         cursor.execute("""
-            INSERT INTO APRENDIZAJE_INCREMENTAL (
+            INSERT INTO ACTUALIZACION_DIARIA_UMBRAL (
                 FECHA_DATOS, ARCHIVO_ENTRADA, TOTAL_REGISTROS,
                 PAISES_TOTALES, UMBRAL_ANTERIOR, N_TREES_ANTERIOR,
                 PAISES_CONOCIDOS_ANTERIOR, ESTADO
             ) VALUES (
                 TRUNC(SYSDATE), :1, :2, :3, :4, :5, :6, 'EN_PROCESO'
-            ) RETURNING ID_APRENDIZAJE INTO :id
+            ) RETURNING ID_ACTUALIZACION INTO :id
         """, [
             os.path.basename(archivo_path),
             total_registros,
@@ -606,7 +608,7 @@ def procesar_actualizacion_diaria(archivo_path: str, df: pd.DataFrame):
         logger.info(f"Iniciando actualización diaria con {len(df)} registros del día")
         
         # Registrar inicio en Oracle
-        if oracle_pool:
+        if oracle.oracle_pool:
             id_actualizacion = registrar_inicio_actualizacion_diaria(
                 archivo_path, len(df), estado_inicial
             )
@@ -630,11 +632,11 @@ def procesar_actualizacion_diaria(archivo_path: str, df: pd.DataFrame):
             }
             
             # Crear features
-            features = crear_features_contextualizadas_mejorada(row_dict, ml.stats_dict)
-            features_scaled = scaler.transform_one(features)
+            features = ml.crear_features_contextualizadas_mejorada(row_dict, ml.stats_dict)
+            features_scaled = ml.scaler.transform_one(features)
             
             # Obtener score del modelo River
-            score = modelo.score_one(features_scaled)
+            score = ml.modelo.score_one(features_scaled)
             scores_dia.append(score)
             
             # Clasificar por tipo para análisis
@@ -794,7 +796,7 @@ def procesar_actualizacion_diaria(archivo_path: str, df: pd.DataFrame):
         tiempo_procesamiento = (tiempo_fin - tiempo_inicio).total_seconds()
         
         # Actualizar registro en Oracle
-        if oracle_pool and id_actualizacion:
+        if oracle.oracle_pool and id_actualizacion:
             actualizar_fin_actualizacion_diaria(
                 id_actualizacion=id_actualizacion,
                 umbral_nuevo=umbral_nuevo,
@@ -832,16 +834,16 @@ def procesar_actualizacion_diaria(archivo_path: str, df: pd.DataFrame):
         logger.error(f"Error en actualización diaria: {str(e)}")
         
         # Actualizar registro de error en Oracle
-        if oracle_pool and id_actualizacion:
+        if oracle.oracle_pool and id_actualizacion:
             try:
                 with get_oracle_connection() as conn:
                     cursor = conn.cursor()
                     cursor.execute("""
-                        UPDATE APRENDIZAJE_INCREMENTAL
+                        UPDATE ACTUALIZACION_DIARIA_UMBRAL
                         SET ESTADO = 'ERROR',
                             MENSAJE_ERROR = :1,
                             TIEMPO_PROCESAMIENTO_SEG = :2
-                        WHERE ID_APRENDIZAJE = :3
+                        WHERE ID_ACTUALIZACION = :3
                     """, [str(e), (datetime.now() - tiempo_inicio).total_seconds(), id_actualizacion])
                     conn.commit()
             except:
@@ -896,7 +898,7 @@ async def actualizar_umbral(configuracion: ConfiguracionUmbral):
             pickle.dump(ml.config, f)
 
         # NUEVO: Guardar en Oracle si está disponible
-        if oracle_pool:
+        if oracle.oracle_pool:
             try:
                 with get_oracle_connection() as conn:
                     cursor = conn.cursor()
@@ -934,7 +936,7 @@ async def actualizar_umbral(configuracion: ConfiguracionUmbral):
             "umbral_anterior": umbral_anterior,
             "umbral_nuevo": ml.umbral_global,
             "timestamp": datetime.now(),
-            "guardado_oracle": oracle_pool is not None
+            "guardado_oracle": oracle.oracle_pool is not None
         }
 
     except Exception as e:
@@ -964,7 +966,7 @@ async def historial_umbrales(dias: int = Query(30, description="Días de histori
     """
     Muestra la evolución del umbral en los últimos días
     """
-    if not oracle_pool:
+    if not oracle.oracle_pool:
         # Si no hay Oracle, buscar en archivos de backup
         backups = []
         for archivo in os.listdir(ml.MODELS_PATH):
@@ -1006,7 +1008,7 @@ async def historial_umbrales(dias: int = Query(30, description="Días de histori
                     UMBRAL_NUEVO,
                     TIEMPO_PROCESAMIENTO_SEG,
                     ESTADO
-                FROM APRENDIZAJE_INCREMENTAL
+                FROM ACTUALIZACION_DIARIA_UMBRAL
                 WHERE FECHA_EJECUCION >= SYSDATE - :dias
                 ORDER BY FECHA_EJECUCION DESC
             """, [dias])
@@ -1431,7 +1433,7 @@ async def historial_actualizacion(
     """
     Obtiene el historial de aprendizajes incrementales realizados
     """
-    if not oracle_pool:
+    if not oracle.oracle_pool:
         raise HTTPException(status_code=503, detail="Oracle no disponible")
 
     try:
@@ -1440,7 +1442,7 @@ async def historial_actualizacion(
 
             cursor.execute("""
                 SELECT 
-                    ID_APRENDIZAJE,
+                    ID_ACTUALIZACION,
                     FECHA_EJECUCION,
                     FECHA_DATOS,
                     TOTAL_REGISTROS,
@@ -1452,7 +1454,7 @@ async def historial_actualizacion(
                     PAISES_CON_CAMBIO_CATEGORIA,
                     TIEMPO_PROCESAMIENTO_SEG,
                     ESTADO
-                FROM APRENDIZAJE_INCREMENTAL
+                FROM ACTUALIZACION_DIARIA_UMBRAL
                 ORDER BY FECHA_EJECUCION DESC
                 FETCH FIRST :limite ROWS ONLY
             """, [limite])
@@ -1479,11 +1481,11 @@ async def historial_actualizacion(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/actualizacion/{id_actualizacion}/detalle", tags=["Actualización Diaria"])
-async def detalle_aprendizaje(id_aprendizaje: int):
+async def detalle_aprendizaje(ID_ACTUALIZACION: int):
     """
     Obtiene el detalle completo de un aprendizaje incremental específico
     """
-    if not oracle_pool:
+    if not oracle.oracle_pool:
         raise HTTPException(status_code=503, detail="Oracle no disponible")
 
     try:
@@ -1491,9 +1493,9 @@ async def detalle_aprendizaje(id_aprendizaje: int):
             cursor = conn.cursor()
 
             cursor.execute("""
-                SELECT * FROM APRENDIZAJE_INCREMENTAL
-                WHERE ID_APRENDIZAJE = :id
-            """, [id_aprendizaje])
+                SELECT * FROM ACTUALIZACION_DIARIA_UMBRAL
+                WHERE ID_ACTUALIZACION = :id
+            """, [ID_ACTUALIZACION])
 
             row = cursor.fetchone()
             if not row:
@@ -1530,7 +1532,7 @@ async def estadisticas_evolucion():
     """
     Muestra la evolución del modelo a través de los aprendizajes incrementales
     """
-    if not oracle_pool:
+    if not oracle.oracle_pool:
         raise HTTPException(status_code=503, detail="Oracle no disponible")
 
     try:
@@ -1543,7 +1545,7 @@ async def estadisticas_evolucion():
                     TO_CHAR(FECHA_EJECUCION, 'YYYY-MM-DD') as fecha,
                     UMBRAL_ANTERIOR,
                     UMBRAL_NUEVO
-                FROM APRENDIZAJE_INCREMENTAL
+                FROM ACTUALIZACION_DIARIA_UMBRAL
                 WHERE ESTADO = 'COMPLETADO'
                 ORDER BY FECHA_EJECUCION
             """)
@@ -1564,7 +1566,7 @@ async def estadisticas_evolucion():
                     PAISES_CONOCIDOS_ANTERIOR,
                     PAISES_CONOCIDOS_NUEVO,
                     PAISES_NUEVOS
-                FROM APRENDIZAJE_INCREMENTAL
+                FROM ACTUALIZACION_DIARIA_UMBRAL
                 WHERE ESTADO = 'COMPLETADO'
                 ORDER BY FECHA_EJECUCION
             """)
@@ -1587,7 +1589,7 @@ async def estadisticas_evolucion():
                     SUM(PAISES_NUEVOS) as total_paises_nuevos,
                     AVG(TIEMPO_PROCESAMIENTO_SEG) as tiempo_promedio,
                     MAX(FECHA_EJECUCION) as ultima_ejecucion
-                FROM APRENDIZAJE_INCREMENTAL
+                FROM ACTUALIZACION_DIARIA_UMBRAL
                 WHERE ESTADO = 'COMPLETADO'
             """)
 
@@ -1865,7 +1867,7 @@ async def exportar_anomalias(
             
             # Generar archivo según formato
             if formato.lower() == "excel":
-                output_path = TEMP_PATH / f"anomalias_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                output_path = ml.TEMP_PATH / f"anomalias_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
                 with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
                     df.to_excel(writer, sheet_name='Anomalías', index=False)
                     
@@ -1893,7 +1895,7 @@ async def exportar_anomalias(
                 content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 filename = f"anomalias_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
             else:
-                output_path = TEMP_PATH / f"anomalias_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                output_path = ml.TEMP_PATH / f"anomalias_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
                 df.to_csv(output_path, index=False, encoding='utf-8-sig')
                 content_type = "text/csv"
                 filename = f"anomalias_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
