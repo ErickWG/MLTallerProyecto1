@@ -2,6 +2,8 @@ from fastapi import APIRouter, File, UploadFile, HTTPException, BackgroundTasks,
 from fastapi.responses import JSONResponse, FileResponse
 from typing import Optional
 from datetime import datetime, timedelta
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 import numpy as np
 import os
@@ -10,6 +12,7 @@ import asyncio
 import pickle
 import shutil
 import logging
+import oracledb  # Agregar esta importación al inicio del archivo
 
 from ..models.schemas import (
     RegistroTelefonico,
@@ -30,6 +33,8 @@ from ..database import oracle
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+executor = ThreadPoolExecutor(max_workers=2)
+
 
 @router.get("/", tags=["General"])
 async def root():
@@ -83,33 +88,27 @@ async def scoring_individual(registro: RegistroTelefonico):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/scoring/batch", tags=["Scoring"])
-async def scoring_batch(file: UploadFile = File(...)):
+async def scoring_batch(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...)
+):
     """
-    Realiza scoring de un archivo CSV con múltiples registros
-    y guarda anomalías en Oracle
+    Realiza scoring de un archivo CSV de forma asíncrona
     """
     if not ml.modelo:
         raise HTTPException(status_code=503, detail="Modelo no disponible")
 
-    lote_id = None
-    temp_file = None
-
     try:
         # Guardar archivo temporal
         temp_file = str(ml.TEMP_PATH / f"temp_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{file.filename}")
-
+        
         with open(temp_file, "wb") as f:
             content = await file.read()
             f.write(content)
 
-        # Leer CSV
-        df = pd.read_csv(temp_file)
-
-        # Convertir CODIGODEPAIS a int si es necesario
-        if 'CODIGODEPAIS' in df.columns:
-            df['CODIGODEPAIS'] = pd.to_numeric(df['CODIGODEPAIS'], errors='coerce').astype('Int64')
-
-        # Validar columnas
+        # Validar archivo básico
+        df = pd.read_csv(temp_file, nrows=5)  # Solo leer primeras 5 filas para validación
+        
         columnas_requeridas = ['FECHA', 'CODIGODEPAIS', 'LINEA', 'N_LLAMADAS', 'N_MINUTOS', 'N_DESTINOS']
         columnas_faltantes = [col for col in columnas_requeridas if col not in df.columns]
 
@@ -117,12 +116,76 @@ async def scoring_batch(file: UploadFile = File(...)):
             os.remove(temp_file)
             raise HTTPException(status_code=400, detail=f"Columnas faltantes: {columnas_faltantes}")
 
+        # Registrar inicio del lote
+        lote_id = None
+        if oracle.oracle_pool:
+            try:
+                lote_id = registrar_lote_procesamiento(
+                    archivo_entrada=file.filename,
+                    total_registros=0,  # Se actualizará después
+                    total_anomalias=0,  # Se actualizará después
+                    tasa_anomalias=0,   # Se actualizará después
+                    archivo_salida=None
+                )
+            except Exception as e:
+                logger.error(f"Error registrando lote: {e}")
+
+        # Procesar en background de forma asíncrona
+        background_tasks.add_task(
+            procesar_lote_async, 
+            temp_file, 
+            file.filename, 
+            lote_id
+        )
+
+        return {
+            "mensaje": "Procesamiento iniciado en segundo plano",
+            "lote_id": lote_id,
+            "archivo": file.filename,
+            "timestamp": datetime.now(),
+            "estado": "EN_PROCESO"
+        }
+
+    except Exception as e:
+        logger.error(f"Error iniciando procesamiento de lote: {str(e)}")
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def procesar_lote_async(archivo_path: str, nombre_archivo: str, lote_id: int):
+    """
+    Procesa el lote de forma asíncrona sin bloquear el hilo principal
+    """
+    loop = asyncio.get_event_loop()
+    
+    try:
+        # Ejecutar en thread pool para no bloquear
+        await loop.run_in_executor(
+            executor, 
+            procesar_lote_sincrono, 
+            archivo_path, 
+            nombre_archivo, 
+            lote_id
+        )
+    except Exception as e:
+        logger.error(f"Error en procesamiento asíncrono: {e}")
+
+def procesar_lote_sincrono(archivo_path: str, nombre_archivo: str, lote_id: int):
+    """
+    Función síncrona que hace el trabajo pesado
+    """
+    try:
+        # Leer CSV completo
+        df = pd.read_csv(archivo_path)
+        
+        if 'CODIGODEPAIS' in df.columns:
+            df['CODIGODEPAIS'] = pd.to_numeric(df['CODIGODEPAIS'], errors='coerce').astype('Int64')
+
         # Procesar registros
         resultados = []
         anomalias_detectadas = 0
 
         for idx, row in df.iterrows():
-            # Saltar filas con CODIGODEPAIS nulo
             if pd.isna(row['CODIGODEPAIS']):
                 continue
 
@@ -155,72 +218,176 @@ async def scoring_batch(file: UploadFile = File(...)):
             if resultado['es_anomalia']:
                 anomalias_detectadas += 1
 
-        # Guardar resultados en CSV
-        df_resultados = pd.DataFrame(resultados)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        archivo_salida = str(ml.OUTPUT_PATH / f"resultados_batch_{timestamp}.csv")
-        df_resultados.to_csv(archivo_salida, index=False)
-
-        # NUEVO: Guardar en Oracle si está disponible
-        if oracle.oracle_pool:
+        # Guardar en Oracle
+        if oracle.oracle_pool and lote_id:
             try:
-                # Registrar lote
-                lote_id = registrar_lote_procesamiento(
-                    archivo_entrada=file.filename,
-                    total_registros=len(resultados),
-                    total_anomalias=anomalias_detectadas,
-                    tasa_anomalias=round(anomalias_detectadas/len(resultados)*100, 2) if len(resultados) > 0 else 0,
-                    archivo_salida=os.path.basename(archivo_salida)
-                )
+                # Actualizar registro del lote
+                with get_oracle_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        UPDATE LOTES_PROCESAMIENTO 
+                        SET TOTAL_REGISTROS = :1,
+                            TOTAL_ANOMALIAS = :2,
+                            TASA_ANOMALIAS = :3,
+                            TIMESTAMP_FIN = :4,
+                            ESTADO = 'COMPLETADO'
+                        WHERE ID_LOTE = :5
+                    """, [
+                        len(resultados),
+                        anomalias_detectadas,
+                        round(anomalias_detectadas/len(resultados)*100, 2) if len(resultados) > 0 else 0,
+                        datetime.now(),
+                        lote_id
+                    ])
+                    conn.commit()
 
-                # Guardar solo las anomalías
-                df_anomalias = df_resultados[df_resultados['es_anomalia'] == True]
+                # Guardar anomalías
+                df_anomalias = pd.DataFrame([r for r in resultados if r['es_anomalia']])
                 if not df_anomalias.empty:
-                    guardar_anomalias_oracle(df_anomalias, file.filename, str(lote_id))
+                    guardar_anomalias_oracle(df_anomalias, nombre_archivo, str(lote_id))
 
-                logger.info(f"Datos guardados en Oracle - Lote ID: {lote_id}")
+                logger.info(f"Procesamiento completado - Lote ID: {lote_id}, Anomalías: {anomalias_detectadas}")
 
             except Exception as e:
                 logger.error(f"Error guardando en Oracle: {e}")
-                # No fallar el proceso si Oracle falla
+                # Marcar como error
+                if oracle.oracle_pool:
+                    with get_oracle_connection() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            UPDATE LOTES_PROCESAMIENTO 
+                            SET ESTADO = 'ERROR', MENSAJE_ERROR = :1
+                            WHERE ID_LOTE = :2
+                        """, [str(e), lote_id])
+                        conn.commit()
 
         # Limpiar archivo temporal
-        os.remove(temp_file)
-
-        # Respuesta
-        return {
-            "mensaje": "Procesamiento completado",
-            "registros_procesados": len(resultados),
-            "anomalias_detectadas": anomalias_detectadas,
-            "tasa_anomalias": round(anomalias_detectadas/len(resultados)*100, 2) if len(resultados) > 0 else 0,
-            "archivo_resultados": os.path.basename(archivo_salida),
-            "lote_id": lote_id,
-            "timestamp": datetime.now(),
-            "guardado_oracle": oracle.oracle_pool is not None
-        }
-
+        if os.path.exists(archivo_path):
+            os.remove(archivo_path)
+            
     except Exception as e:
-        logger.error(f"Error en scoring batch: {str(e)}")
-        if temp_file and os.path.exists(temp_file):
-            os.remove(temp_file)
-
-        # Registrar error en Oracle si es posible
-        if oracle.oracle_pool and lote_id is None:
+        logger.error(f"Error en procesamiento síncrono: {e}")
+        
+        # Marcar lote como error
+        if oracle.oracle_pool and lote_id:
             try:
                 with get_oracle_connection() as conn:
                     cursor = conn.cursor()
                     cursor.execute("""
-                        INSERT INTO LOTES_PROCESAMIENTO 
-                        (TIMESTAMP_INICIO, ARCHIVO_ENTRADA, ESTADO, MENSAJE_ERROR)
-                        VALUES (:1, :2, :3, :4)
-                    """, [datetime.now(), file.filename, "ERROR", str(e)])
+                        UPDATE LOTES_PROCESAMIENTO 
+                        SET ESTADO = 'ERROR', MENSAJE_ERROR = :1
+                        WHERE ID_LOTE = :2
+                    """, [str(e), lote_id])
                     conn.commit()
             except:
                 pass
+        
+        if os.path.exists(archivo_path):
+            os.remove(archivo_path)
 
+
+@router.get("/alertas/{id_alerta}/detalle", tags=["Alertas Oracle"])
+async def obtener_detalle_alerta(id_alerta: int):
+    """
+    Obtiene el detalle completo de una alerta específica
+    """
+    if not oracle.oracle_pool:
+        raise HTTPException(status_code=503, detail="Oracle no disponible")
+
+    try:
+        with get_oracle_connection() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                SELECT 
+                    ID_ALERTA, FECHA_PROCESAMIENTO, FECHA_REGISTRO, CODIGO_PAIS, 
+                    LINEA, N_LLAMADAS, N_MINUTOS, N_DESTINOS, SCORE_ANOMALIA,
+                    UMBRAL, TIPO_ANOMALIA, TIPO_CONTEXTO, RAZON_DECISION,
+                    ARCHIVO_ORIGEN, LOTE_PROCESAMIENTO
+                FROM ALERTAS_FRAUDE
+                WHERE ID_ALERTA = :id_alerta
+            """, [id_alerta])
+
+            row = cursor.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Alerta no encontrada")
+
+            # Obtener nombres de columnas
+            columnas = [col[0] for col in cursor.description]
+            alerta = dict(zip(columnas, row))
+            
+            # Convertir datetime a string
+            if alerta['FECHA_PROCESAMIENTO']:
+                alerta['FECHA_PROCESAMIENTO'] = alerta['FECHA_PROCESAMIENTO'].isoformat()
+
+            return {
+                "alerta": alerta
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error obteniendo detalle de alerta: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    
+@router.get("/lotes/{id_lote}/descargar", tags=["Alertas Oracle"])
+async def descargar_archivo_lote(id_lote: int):
+    """
+    Genera y descarga las anomalías de un lote específico
+    """
+    if not oracle.oracle_pool:
+        raise HTTPException(status_code=503, detail="Oracle no disponible")
 
+    try:
+        with get_oracle_connection() as conn:
+            cursor = conn.cursor()
 
+            # Obtener información del lote
+            cursor.execute("""
+                SELECT ARCHIVO_ENTRADA, TIMESTAMP_INICIO 
+                FROM LOTES_PROCESAMIENTO 
+                WHERE ID_LOTE = :id_lote
+            """, [id_lote])
+            
+            lote_info = cursor.fetchone()
+            if not lote_info:
+                raise HTTPException(status_code=404, detail="Lote no encontrado")
+
+            # Obtener alertas del lote
+            cursor.execute("""
+                SELECT 
+                    FECHA_REGISTRO, CODIGO_PAIS, LINEA, N_LLAMADAS, 
+                    N_MINUTOS, N_DESTINOS, SCORE_ANOMALIA, UMBRAL,
+                    TIPO_ANOMALIA, TIPO_CONTEXTO, RAZON_DECISION
+                FROM ALERTAS_FRAUDE
+                WHERE LOTE_PROCESAMIENTO = :lote_id
+                ORDER BY FECHA_PROCESAMIENTO
+            """, [str(id_lote)])
+
+            # Convertir a DataFrame
+            columns = [col[0] for col in cursor.description]
+            data = cursor.fetchall()
+            df = pd.DataFrame(data, columns=columns)
+
+            if df.empty:
+                raise HTTPException(status_code=404, detail="No hay anomalías en este lote")
+
+            # Generar archivo temporal
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            temp_file = ml.TEMP_PATH / f"lote_{id_lote}_{timestamp}.csv"
+            df.to_csv(temp_file, index=False)
+
+            return FileResponse(
+                path=temp_file,
+                media_type="text/csv",
+                filename=f"anomalias_lote_{id_lote}.csv"
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error descargando archivo de lote: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 # # ## NUEVO ENDPOINT CONSULTAS ORACLE
 
 # In[11]:
@@ -489,7 +656,8 @@ def registrar_inicio_actualizacion_diaria(archivo_path, total_registros, estado_
         except:
             paises_en_archivo = 0
 
-        id_var = cursor.var(oracle.NUMBER)
+        # CAMBIO: usar oracledb.NUMBER en lugar de oracle.NUMBER
+        id_var = cursor.var(oracledb.NUMBER)
 
         cursor.execute("""
             INSERT INTO ACTUALIZACION_DIARIA_UMBRAL (
@@ -532,7 +700,7 @@ def actualizar_fin_actualizacion_diaria(id_actualizacion, **kwargs):
             kwargs['tiempo_procesamiento'],
             kwargs['estado'],
             os.path.basename(kwargs['backup_path']),
-            f"Cambio: {kwargs.get('razon_cambio', 'N/A')}, Precision: {kwargs.get('metricas_performance', {}).get('precision', 0):.2f}",
+            f"Cambio: {kwargs.get('razon_cambio', 'N/A')}",
             id_actualizacion
         ])
         
@@ -542,16 +710,199 @@ def actualizar_fin_actualizacion_diaria(id_actualizacion, **kwargs):
 # 
 
 # In[13]:
-
+def procesar_actualizacion_diaria_sincrono(archivo_path: str, df: pd.DataFrame):
+    """
+    Versión síncrona que retorna el resultado en lugar de ejecutarse en background
+    """
+    
+    # Variables para tracking
+    tiempo_inicio = datetime.now()
+    id_actualizacion = None
+    estado_inicial = {
+        'umbral': ml.umbral_global,
+        'n_trees': ml.config.get('n_trees', 0),
+        'paises_conocidos': len(ml.stats_dict)
+    }
+    
+    try:
+        logger.info(f"Iniciando actualización diaria con {len(df)} registros")
+        
+        # Registrar inicio en Oracle
+        if oracle.oracle_pool:
+            id_actualizacion = registrar_inicio_actualizacion_diaria(
+                archivo_path, len(df), estado_inicial
+            )
+        
+        # 1. CALCULAR SCORES PARA TODOS LOS REGISTROS DEL DÍA
+        scores_dia = []
+        scores_por_tipo = {
+            'normales': [],
+            'minutos_extremos': [],
+            'spray_calling': [],
+            'volumen_alto': [],
+            'pais_bajo': []
+        }
+        
+        for idx, row in df.iterrows():
+            if pd.isna(row.get('CODIGODEPAIS')):
+                continue
+                
+            row_dict = {
+                'CODIGODEPAIS': int(row['CODIGODEPAIS']),
+                'N_LLAMADAS': row['N_LLAMADAS'],
+                'N_MINUTOS': row['N_MINUTOS'],
+                'N_DESTINOS': row['N_DESTINOS']
+            }
+            
+            # Crear features
+            features = ml.crear_features_contextualizadas_mejorada(row_dict, ml.stats_dict)
+            features_scaled = ml.scaler.transform_one(features)
+            
+            # Obtener score del modelo River
+            score = ml.modelo.score_one(features_scaled)
+            scores_dia.append(score)
+            
+            # Clasificar por tipo para análisis
+            pais = row_dict['CODIGODEPAIS']
+            minutos = row_dict['N_MINUTOS']
+            llamadas = row_dict['N_LLAMADAS']
+            destinos = row_dict['N_DESTINOS']
+            
+            if minutos >= ml.parametros_features['umbral_minutos_extremos']:
+                scores_por_tipo['minutos_extremos'].append(score)
+            elif destinos >= 6 and llamadas >= 12:
+                scores_por_tipo['spray_calling'].append(score)
+            elif llamadas > 50 or destinos > 15:
+                scores_por_tipo['volumen_alto'].append(score)
+            elif pais not in ml.stats_dict or ml.stats_dict.get(pais, {}).get('CATEGORIA') in ['Muy_Bajo', 'Bajo']:
+                scores_por_tipo['pais_bajo'].append(score)
+            else:
+                scores_por_tipo['normales'].append(score)
+        
+        if not scores_dia:
+            raise ValueError("No se pudieron procesar registros válidos")
+        
+        # 2. ANÁLISIS ESTADÍSTICO DE SCORES
+        analisis_scores = {
+            'media': np.mean(scores_dia),
+            'mediana': np.median(scores_dia),
+            'std': np.std(scores_dia),
+            'p90': np.percentile(scores_dia, 90),
+            'p95': np.percentile(scores_dia, 95),
+            'p99': np.percentile(scores_dia, 99),
+            'min': np.min(scores_dia),
+            'max': np.max(scores_dia)
+        }
+        
+        # 3. CALCULAR NUEVO UMBRAL ADAPTATIVO
+        umbral_estadistico = analisis_scores['p95']
+        
+        if len(scores_por_tipo['normales']) > 0:
+            umbral_separacion = np.percentile(scores_por_tipo['normales'], 99)
+        else:
+            umbral_separacion = umbral_estadistico
+        
+        # 4. DECISIÓN FINAL DEL UMBRAL
+        umbral_candidato = min(umbral_estadistico, umbral_separacion)
+        
+        # Aplicar límites de cambio (máximo 10% de cambio por día)
+        cambio_maximo = ml.umbral_global * 0.1
+        
+        if umbral_candidato > ml.umbral_global + cambio_maximo:
+            umbral_nuevo = ml.umbral_global + cambio_maximo
+            razon_cambio = "Incremento limitado al 10%"
+        elif umbral_candidato < ml.umbral_global - cambio_maximo:
+            umbral_nuevo = ml.umbral_global - cambio_maximo
+            razon_cambio = "Decremento limitado al 10%"
+        else:
+            umbral_nuevo = umbral_candidato
+            razon_cambio = "Ajuste dentro del rango permitido"
+        
+        # 5. ACTUALIZAR CONFIGURACIÓN
+        ml.umbral_global = umbral_nuevo
+        ml.config['umbral_global'] = ml.umbral_global
+        ml.config['fecha_ultima_actualizacion'] = datetime.now().isoformat()
+        
+        # Guardar configuración actualizada
+        with open(ml.MODELS_PATH / "config_modelo_general.pkl", 'wb') as f:
+            pickle.dump(ml.config, f)
+        
+        # Crear backup de configuración
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = ml.MODELS_PATH / f"backup_config_diaria_{timestamp}.pkl"
+        with open(backup_path, 'wb') as f:
+            pickle.dump(ml.config, f)
+        
+        # Calcular tiempo de procesamiento
+        tiempo_fin = datetime.now()
+        tiempo_procesamiento = (tiempo_fin - tiempo_inicio).total_seconds()
+        
+        # Actualizar registro en Oracle
+        if oracle.oracle_pool and id_actualizacion:
+            actualizar_fin_actualizacion_diaria(
+                id_actualizacion=id_actualizacion,
+                registros_analizados=len(df),
+                umbral_nuevo=umbral_nuevo,
+                tiempo_procesamiento=tiempo_procesamiento,
+                estado="COMPLETADO",
+                backup_path=str(backup_path),
+                razon_cambio=razon_cambio
+            )
+        
+        # Limpiar archivo temporal
+        if os.path.exists(archivo_path):
+            os.remove(archivo_path)
+        
+        logger.info(f"""
+        Actualización diaria completada:
+        - Registros analizados: {len(df)}
+        - Umbral anterior: {estado_inicial['umbral']:.4f}
+        - Umbral nuevo: {umbral_nuevo:.4f}
+        - Cambio: {((umbral_nuevo - estado_inicial['umbral']) / estado_inicial['umbral'] * 100):.2f}%
+        - Tiempo: {tiempo_procesamiento:.2f} segundos
+        """)
+        
+        # RETORNAR EL RESULTADO
+        return {
+            'registros_analizados': len(df),
+            'umbral_anterior': estado_inicial['umbral'],
+            'umbral_nuevo': umbral_nuevo,
+            'cambio_porcentual': ((umbral_nuevo - estado_inicial['umbral']) / estado_inicial['umbral'] * 100),
+            'razon_cambio': razon_cambio,
+            'tiempo_procesamiento': tiempo_procesamiento
+        }
+        
+    except Exception as e:
+        logger.error(f"Error en actualización diaria: {str(e)}")
+        
+        # Actualizar registro de error en Oracle
+        if oracle.oracle_pool and id_actualizacion:
+            try:
+                with get_oracle_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        UPDATE ACTUALIZACION_DIARIA_UMBRAL
+                        SET ESTADO = 'ERROR',
+                            MENSAJE_ERROR = :1,
+                            TIEMPO_PROCESAMIENTO_SEG = :2
+                        WHERE ID_ACTUALIZACION = :3
+                    """, [str(e), (datetime.now() - tiempo_inicio).total_seconds(), id_actualizacion])
+                    conn.commit()
+            except:
+                pass
+        
+        if os.path.exists(archivo_path):
+            os.remove(archivo_path)
+        
+        raise e
 
 @router.post("/modelo/actualizacion-diaria", tags=["Modelo"])
 async def actualizacion_diaria(
-    file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = BackgroundTasks()
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...)
 ):
     """
-    Realiza la actualización diaria del umbral basándose en los datos del día
-    NO modifica el modelo River, solo recalcula el umbral óptimo
+    Realiza la actualización diaria del umbral de forma asíncrona
     """
     if not ml.modelo:
         raise HTTPException(status_code=503, detail="Modelo no disponible")
@@ -564,23 +915,27 @@ async def actualizacion_diaria(
             content = await file.read()
             f.write(content)
         
-        # Validar archivo
-        df = pd.read_csv(temp_file)
+        # Validar archivo básico
+        df = pd.read_csv(temp_file, nrows=5)
         
-        # Verificar que sean datos de un solo día
-        if 'FECHA' in df.columns:
-            fechas_unicas = df['FECHA'].nunique()
-            if fechas_unicas > 1:
-                logger.warning(f"El archivo contiene datos de {fechas_unicas} días diferentes")
+        columnas_requeridas = ['CODIGODEPAIS', 'N_LLAMADAS', 'N_MINUTOS', 'N_DESTINOS']
+        columnas_faltantes = [col for col in columnas_requeridas if col not in df.columns]
         
-        # Agregar tarea en background
-        background_tasks.add_task(procesar_actualizacion_diaria, temp_file, df)
+        if columnas_faltantes:
+            os.remove(temp_file)
+            raise HTTPException(status_code=400, detail=f"Columnas faltantes: {columnas_faltantes}")
+
+        # Procesar en background
+        background_tasks.add_task(
+            procesar_actualizacion_async, 
+            temp_file
+        )
         
         return {
-            "mensaje": "Actualización diaria del umbral iniciada",
-            "registros_a_analizar": len(df),
-            "umbral_actual": ml.umbral_global,
-            "timestamp": datetime.now()
+            "mensaje": "Actualización diaria iniciada en segundo plano",
+            "archivo": file.filename,
+            "timestamp": datetime.now(),
+            "estado": "EN_PROCESO"
         }
         
     except Exception as e:
@@ -588,6 +943,270 @@ async def actualizacion_diaria(
         if os.path.exists(temp_file):
             os.remove(temp_file)
         raise HTTPException(status_code=500, detail=str(e))
+
+async def procesar_actualizacion_async(archivo_path: str):
+    """
+    Procesa la actualización de forma asíncrona
+    """
+    loop = asyncio.get_event_loop()
+    
+    try:
+        # Leer archivo completo
+        df = pd.read_csv(archivo_path)
+        
+        # Ejecutar en thread pool
+        await loop.run_in_executor(
+            executor, 
+            procesar_actualizacion_diaria_sincrono_v2, 
+            archivo_path, 
+            df
+        )
+    except Exception as e:
+        logger.error(f"Error en actualización asíncrona: {e}")
+
+def procesar_actualizacion_diaria_sincrono_v2(archivo_path: str, df: pd.DataFrame):
+    """
+    Versión síncrona V2 para procesamiento en thread pool sin bloquear FastAPI
+    """
+    
+    tiempo_inicio = datetime.now()
+    id_actualizacion = None
+    estado_inicial = {
+        'umbral': ml.umbral_global,
+        'n_trees': ml.config.get('n_trees', 0),
+        'paises_conocidos': len(ml.stats_dict)
+    }
+    
+    try:
+        logger.info(f"Iniciando actualización diaria asíncrona con {len(df)} registros")
+        
+        # Registrar inicio en Oracle
+        if oracle.oracle_pool:
+            id_actualizacion = registrar_inicio_actualizacion_diaria(
+                archivo_path, len(df), estado_inicial
+            )
+        
+        # 1. CALCULAR SCORES PARA TODOS LOS REGISTROS DEL DÍA
+        scores_dia = []
+        scores_por_tipo = {
+            'normales': [],
+            'minutos_extremos': [],
+            'spray_calling': [],
+            'volumen_alto': [],
+            'pais_bajo': []
+        }
+        
+        # Procesar en lotes para evitar memoria excesiva
+        batch_size = 1000
+        total_rows = len(df)
+        
+        for start_idx in range(0, total_rows, batch_size):
+            end_idx = min(start_idx + batch_size, total_rows)
+            batch_df = df.iloc[start_idx:end_idx]
+            
+            logger.info(f"Procesando lote {start_idx}-{end_idx} de {total_rows}")
+            
+            for idx, row in batch_df.iterrows():
+                if pd.isna(row.get('CODIGODEPAIS')):
+                    continue
+                    
+                try:
+                    row_dict = {
+                        'CODIGODEPAIS': int(row['CODIGODEPAIS']),
+                        'N_LLAMADAS': row['N_LLAMADAS'],
+                        'N_MINUTOS': row['N_MINUTOS'],
+                        'N_DESTINOS': row['N_DESTINOS']
+                    }
+                    
+                    # Crear features
+                    features = ml.crear_features_contextualizadas_mejorada(row_dict, ml.stats_dict)
+                    features_scaled = ml.scaler.transform_one(features)
+                    
+                    # Obtener score del modelo River
+                    score = ml.modelo.score_one(features_scaled)
+                    scores_dia.append(score)
+                    
+                    # Clasificar por tipo para análisis
+                    pais = row_dict['CODIGODEPAIS']
+                    minutos = row_dict['N_MINUTOS']
+                    llamadas = row_dict['N_LLAMADAS']
+                    destinos = row_dict['N_DESTINOS']
+                    
+                    if minutos >= ml.parametros_features['umbral_minutos_extremos']:
+                        scores_por_tipo['minutos_extremos'].append(score)
+                    elif destinos >= 6 and llamadas >= 12:
+                        scores_por_tipo['spray_calling'].append(score)
+                    elif llamadas > 50 or destinos > 15:
+                        scores_por_tipo['volumen_alto'].append(score)
+                    elif pais not in ml.stats_dict or ml.stats_dict.get(pais, {}).get('CATEGORIA') in ['Muy_Bajo', 'Bajo']:
+                        scores_por_tipo['pais_bajo'].append(score)
+                    else:
+                        scores_por_tipo['normales'].append(score)
+                        
+                except Exception as e:
+                    logger.warning(f"Error procesando fila {idx}: {e}")
+                    continue
+        
+        if not scores_dia:
+            raise ValueError("No se pudieron procesar registros válidos")
+        
+        logger.info(f"Procesados {len(scores_dia)} registros con scores válidos")
+        
+        # 2. ANÁLISIS ESTADÍSTICO DE SCORES
+        analisis_scores = {
+            'media': np.mean(scores_dia),
+            'mediana': np.median(scores_dia),
+            'std': np.std(scores_dia),
+            'p90': np.percentile(scores_dia, 90),
+            'p95': np.percentile(scores_dia, 95),
+            'p99': np.percentile(scores_dia, 99),
+            'min': np.min(scores_dia),
+            'max': np.max(scores_dia)
+        }
+        
+        # 3. CALCULAR NUEVO UMBRAL ADAPTATIVO
+        umbral_estadistico = analisis_scores['p95']
+        
+        if len(scores_por_tipo['normales']) > 0:
+            umbral_separacion = np.percentile(scores_por_tipo['normales'], 99)
+        else:
+            umbral_separacion = umbral_estadistico
+        
+        # 4. DECISIÓN FINAL DEL UMBRAL
+        umbral_candidato = min(umbral_estadistico, umbral_separacion)
+        
+        # Aplicar límites de cambio (máximo 10% de cambio por día)
+        cambio_maximo = ml.umbral_global * 0.1
+        
+        if umbral_candidato > ml.umbral_global + cambio_maximo:
+            umbral_nuevo = ml.umbral_global + cambio_maximo
+            razon_cambio = "Incremento limitado al 10%"
+        elif umbral_candidato < ml.umbral_global - cambio_maximo:
+            umbral_nuevo = ml.umbral_global - cambio_maximo
+            razon_cambio = "Decremento limitado al 10%"
+        else:
+            umbral_nuevo = umbral_candidato
+            razon_cambio = "Ajuste dentro del rango permitido"
+        
+        # 5. ACTUALIZAR ESTADÍSTICAS POR PAÍS (sin cambiar el modelo)
+        estadisticas_dia = {}
+        paises_unicos = df['CODIGODEPAIS'].dropna().unique()
+        
+        for pais in paises_unicos:
+            try:
+                pais = int(pais)
+                datos_pais = df[df['CODIGODEPAIS'] == pais]
+                
+                estadisticas_dia[pais] = {
+                    'registros': len(datos_pais),
+                    'llamadas_mean': float(datos_pais['N_LLAMADAS'].mean()),
+                    'minutos_mean': float(datos_pais['N_MINUTOS'].mean()),
+                    'destinos_mean': float(datos_pais['N_DESTINOS'].mean()),
+                    'llamadas_max': int(datos_pais['N_LLAMADAS'].max()),
+                    'minutos_max': float(datos_pais['N_MINUTOS'].max()),
+                    'destinos_max': int(datos_pais['N_DESTINOS'].max())
+                }
+            except Exception as e:
+                logger.warning(f"Error procesando estadísticas del país {pais}: {e}")
+                continue
+        
+        # 6. ACTUALIZAR CONFIGURACIÓN
+        umbral_anterior = ml.umbral_global
+        ml.umbral_global = umbral_nuevo
+        ml.config['umbral_global'] = ml.umbral_global
+        ml.config['fecha_ultima_actualizacion'] = datetime.now().isoformat()
+        ml.config['ultima_actualizacion_diaria'] = {
+            'fecha': datetime.now().isoformat(),
+            'registros_analizados': len(df),
+            'umbral_anterior': umbral_anterior,
+            'umbral_nuevo': umbral_nuevo,
+            'cambio_porcentual': ((umbral_nuevo - umbral_anterior) / umbral_anterior * 100),
+            'razon_cambio': razon_cambio,
+            'analisis_scores': analisis_scores,
+            'estadisticas_dia': estadisticas_dia
+        }
+        
+        # Guardar configuración actualizada (NO el modelo, solo la config)
+        try:
+            with open(ml.MODELS_PATH / "config_modelo_general.pkl", 'wb') as f:
+                pickle.dump(ml.config, f)
+            
+            # Crear backup de configuración
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = ml.MODELS_PATH / f"backup_config_diaria_{timestamp}.pkl"
+            with open(backup_path, 'wb') as f:
+                pickle.dump(ml.config, f)
+                
+        except Exception as e:
+            logger.error(f"Error guardando configuración: {e}")
+        
+        # Calcular tiempo de procesamiento
+        tiempo_fin = datetime.now()
+        tiempo_procesamiento = (tiempo_fin - tiempo_inicio).total_seconds()
+        
+        # Actualizar registro en Oracle
+        if oracle.oracle_pool and id_actualizacion:
+            try:
+                actualizar_fin_actualizacion_diaria(
+                    id_actualizacion=id_actualizacion,
+                    registros_analizados=len(df),
+                    umbral_nuevo=umbral_nuevo,
+                    tiempo_procesamiento=tiempo_procesamiento,
+                    estado="COMPLETADO",
+                    backup_path=str(backup_path) if 'backup_path' in locals() else '',
+                    razon_cambio=razon_cambio
+                )
+            except Exception as e:
+                logger.error(f"Error actualizando Oracle: {e}")
+        
+        # Limpiar archivo temporal
+        if os.path.exists(archivo_path):
+            os.remove(archivo_path)
+        
+        logger.info(f"""
+        Actualización diaria completada asíncronamente:
+        - Registros analizados: {len(df)}
+        - Scores calculados: {len(scores_dia)}
+        - Umbral anterior: {umbral_anterior:.4f}
+        - Umbral nuevo: {umbral_nuevo:.4f}
+        - Cambio: {((umbral_nuevo - umbral_anterior) / umbral_anterior * 100):.2f}%
+        - Tiempo total: {tiempo_procesamiento:.2f} segundos
+        """)
+        
+        return {
+            'registros_analizados': len(df),
+            'scores_calculados': len(scores_dia),
+            'umbral_anterior': umbral_anterior,
+            'umbral_nuevo': umbral_nuevo,
+            'cambio_porcentual': ((umbral_nuevo - umbral_anterior) / umbral_anterior * 100),
+            'razon_cambio': razon_cambio,
+            'tiempo_procesamiento': tiempo_procesamiento,
+            'paises_procesados': len(estadisticas_dia)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error en actualización diaria asíncrona: {str(e)}")
+        
+        # Actualizar registro de error en Oracle
+        if oracle.oracle_pool and id_actualizacion:
+            try:
+                with get_oracle_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        UPDATE ACTUALIZACION_DIARIA_UMBRAL
+                        SET ESTADO = 'ERROR',
+                            MENSAJE_ERROR = :1,
+                            TIEMPO_PROCESAMIENTO_SEG = :2
+                        WHERE ID_ACTUALIZACION = :3
+                    """, [str(e), (datetime.now() - tiempo_inicio).total_seconds(), id_actualizacion])
+                    conn.commit()
+            except Exception as oracle_error:
+                logger.error(f"Error actualizando Oracle con error: {oracle_error}")
+        
+        if os.path.exists(archivo_path):
+            os.remove(archivo_path)
+        
+        raise e
 
 def procesar_actualizacion_diaria(archivo_path: str, df: pd.DataFrame):
     """
@@ -704,43 +1323,7 @@ def procesar_actualizacion_diaria(archivo_path: str, df: pd.DataFrame):
             umbral_nuevo = umbral_candidato
             razon_cambio = "Ajuste dentro del rango permitido"
         
-        # 5. VALIDAR NUEVO UMBRAL CON DATOS DEL DÍA
-        falsos_positivos = 0
-        falsos_negativos = 0
-        verdaderos_positivos = 0
-        verdaderos_negativos = 0
-        
-        for idx, score in enumerate(scores_dia):
-            row = df.iloc[idx]
-            
-            # Predicción con nuevo umbral
-            es_anomalia_nuevo = score > umbral_nuevo
-            
-            # Verificar si debería ser anomalía según reglas de negocio
-            es_anomalia_real = False
-            if row['N_MINUTOS'] >= ml.parametros_features['umbral_minutos_extremos']:
-                es_anomalia_real = True
-            elif row['N_DESTINOS'] >= 10 and row['N_LLAMADAS'] >= 20:
-                es_anomalia_real = True
-            elif row['N_LLAMADAS'] > 100:
-                es_anomalia_real = True
-            
-            # Calcular métricas
-            if es_anomalia_nuevo and es_anomalia_real:
-                verdaderos_positivos += 1
-            elif es_anomalia_nuevo and not es_anomalia_real:
-                falsos_positivos += 1
-            elif not es_anomalia_nuevo and es_anomalia_real:
-                falsos_negativos += 1
-            else:
-                verdaderos_negativos += 1
-        
-        # Calcular métricas de performance
-        precision = verdaderos_positivos / (verdaderos_positivos + falsos_positivos) if (verdaderos_positivos + falsos_positivos) > 0 else 0
-        recall = verdaderos_positivos / (verdaderos_positivos + falsos_negativos) if (verdaderos_positivos + falsos_negativos) > 0 else 0
-        f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-        
-        # 6. ACTUALIZAR ESTADÍSTICAS POR PAÍS (sin cambiar el modelo)
+        # 5. ACTUALIZAR ESTADÍSTICAS POR PAÍS (sin cambiar el modelo)
         estadisticas_dia = {}
         for pais in df['CODIGODEPAIS'].unique():
             if pd.isna(pais):
@@ -759,7 +1342,7 @@ def procesar_actualizacion_diaria(archivo_path: str, df: pd.DataFrame):
                 'destinos_max': datos_pais['N_DESTINOS'].max()
             }
         
-        # 7. ACTUALIZAR CONFIGURACIÓN
+        # 6. ACTUALIZAR CONFIGURACIÓN
         ml.umbral_global = umbral_nuevo
         ml.config['umbral_global'] = ml.umbral_global
         ml.config['fecha_ultima_actualizacion'] = datetime.now().isoformat()
@@ -770,13 +1353,6 @@ def procesar_actualizacion_diaria(archivo_path: str, df: pd.DataFrame):
             'umbral_nuevo': umbral_nuevo,
             'cambio_porcentual': ((umbral_nuevo - estado_inicial['umbral']) / estado_inicial['umbral'] * 100),
             'razon_cambio': razon_cambio,
-            'metricas': {
-                'precision': precision,
-                'recall': recall,
-                'f1_score': f1_score,
-                'falsos_positivos': falsos_positivos,
-                'falsos_negativos': falsos_negativos
-            },
             'analisis_scores': analisis_scores,
             'estadisticas_dia': estadisticas_dia
         }
@@ -799,20 +1375,12 @@ def procesar_actualizacion_diaria(archivo_path: str, df: pd.DataFrame):
         if oracle.oracle_pool and id_actualizacion:
             actualizar_fin_actualizacion_diaria(
                 id_actualizacion=id_actualizacion,
+                registros_analizados=len(df),
                 umbral_nuevo=umbral_nuevo,
-                cambio_porcentual=((umbral_nuevo - estado_inicial['umbral']) / estado_inicial['umbral'] * 100),
-                razon_cambio=razon_cambio,
-                metricas_performance={
-                    'precision': precision,
-                    'recall': recall,
-                    'f1_score': f1_score,
-                    'falsos_positivos': falsos_positivos,
-                    'falsos_negativos': falsos_negativos
-                },
-                analisis_scores=analisis_scores,
                 tiempo_procesamiento=tiempo_procesamiento,
+                estado="COMPLETADO",
                 backup_path=str(backup_path),
-                estado="COMPLETADO"
+                razon_cambio=razon_cambio
             )
         
         # Limpiar archivo temporal
@@ -824,9 +1392,6 @@ def procesar_actualizacion_diaria(archivo_path: str, df: pd.DataFrame):
         - Umbral anterior: {estado_inicial['umbral']:.4f}
         - Umbral nuevo: {umbral_nuevo:.4f}
         - Cambio: {((umbral_nuevo - estado_inicial['umbral']) / estado_inicial['umbral'] * 100):.2f}%
-        - Precisión: {precision:.2f}
-        - Recall: {recall:.2f}
-        - F1-Score: {f1_score:.2f}
         - Tiempo: {tiempo_procesamiento:.2f} segundos
         """)
         
@@ -964,80 +1529,192 @@ async def recargar_modelo():
 @router.get("/modelo/historial-umbrales", tags=["Modelo"])
 async def historial_umbrales(dias: int = Query(30, description="Días de historial")):
     """
-    Muestra la evolución del umbral en los últimos días
+    Muestra la evolución del umbral combinando cambios manuales y automáticos
     """
     if not oracle.oracle_pool:
-        # Si no hay Oracle, buscar en archivos de backup
-        backups = []
-        for archivo in os.listdir(ml.MODELS_PATH):
-            if archivo.startswith("backup_config_diaria_"):
-                fecha_str = archivo.split("_")[3].split(".")[0]
-                try:
-                    fecha = datetime.strptime(fecha_str[:8], "%Y%m%d")
-                    
-                    with open(ml.MODELS_PATH / archivo, 'rb') as f:
-                        config_backup = pickle.load(f)
-                    
-                    if 'ultima_actualizacion_diaria' in config_backup:
-                        info = config_backup['ultima_actualizacion_diaria']
-                        backups.append({
-                            'fecha': fecha.strftime("%Y-%m-%d"),
-                            'umbral': config_backup['umbral_global'],
-                            'cambio_porcentual': info.get('cambio_porcentual', 0),
-                            'precision': info['metricas']['precision'],
-                            'recall': info['metricas']['recall'],
-                            'f1_score': info['metricas']['f1_score']
-                        })
-                except:
-                    continue
-        
         return {
-            "historial": sorted(backups, key=lambda x: x['fecha'], reverse=True)[:dias],
-            "fuente": "archivos_backup"
+            "historial": [],
+            "fuente": "oracle_no_disponible",
+            "umbral_actual": ml.umbral_global
         }
     
-    # Si hay Oracle, consultar de la BD
     try:
         with get_oracle_connection() as conn:
             cursor = conn.cursor()
             
+            historial_combinado = []
+            
+            # 1. Obtener cambios de actualizaciones diarias (automáticos)
             cursor.execute("""
                 SELECT 
-                    FECHA_EJECUCION,
+                    FECHA_EJECUCION as FECHA,
                     UMBRAL_ANTERIOR,
                     UMBRAL_NUEVO,
                     TIEMPO_PROCESAMIENTO_SEG,
-                    ESTADO
+                    ESTADO,
+                    OBSERVACIONES,
+                    'AUTOMATICO' as TIPO_CAMBIO,
+                    'Sistema' as USUARIO
                 FROM ACTUALIZACION_DIARIA_UMBRAL
                 WHERE FECHA_EJECUCION >= SYSDATE - :dias
-                ORDER BY FECHA_EJECUCION DESC
+                AND UMBRAL_ANTERIOR IS NOT NULL 
+                AND UMBRAL_NUEVO IS NOT NULL
             """, [dias])
             
-            historial = []
             for row in cursor:
-                historial.append({
-                    'fecha': row[0].strftime("%Y-%m-%d %H:%M"),
+                historial_combinado.append({
+                    'fecha': row[0].strftime('%Y-%m-%d %H:%M') if row[0] else None,
                     'umbral_anterior': float(row[1]) if row[1] else None,
                     'umbral_nuevo': float(row[2]) if row[2] else None,
                     'cambio': float(row[2] - row[1]) if row[1] and row[2] else None,
                     'tiempo_seg': float(row[3]) if row[3] else None,
-                    'estado': row[4]
+                    'estado': row[4] or 'COMPLETADO',
+                    'razon': row[5] or 'Actualización automática diaria',
+                    'tipo_cambio': row[6],  # 'AUTOMATICO'
+                    'usuario': row[7],      # 'Sistema'
+                    'timestamp_orden': row[0]  # Para ordenar después
                 })
             
+            # 2. Obtener cambios manuales
+            cursor.execute("""
+                SELECT 
+                    FECHA_CAMBIO as FECHA,
+                    UMBRAL_ANTERIOR,
+                    UMBRAL_NUEVO,
+                    RAZON_CAMBIO,
+                    USUARIO,
+                    'MANUAL' as TIPO_CAMBIO
+                FROM HISTORICO_UMBRALES
+                WHERE FECHA_CAMBIO >= SYSDATE - :dias
+            """, [dias])
+            
+            for row in cursor:
+                historial_combinado.append({
+                    'fecha': row[0].strftime('%Y-%m-%d %H:%M') if row[0] else None,
+                    'umbral_anterior': float(row[1]) if row[1] else None,
+                    'umbral_nuevo': float(row[2]) if row[2] else None,
+                    'cambio': float(row[2] - row[1]) if row[1] and row[2] else None,
+                    'tiempo_seg': None,  # Los cambios manuales no tienen tiempo de procesamiento
+                    'estado': 'COMPLETADO',
+                    'razon': row[3] or 'Cambio manual',
+                    'tipo_cambio': row[5],  # 'MANUAL'
+                    'usuario': row[4] or 'Usuario',
+                    'timestamp_orden': row[0]  # Para ordenar después
+                })
+            
+            # 3. Ordenar por fecha descendente (más recientes primero)
+            historial_combinado.sort(
+                key=lambda x: x['timestamp_orden'] if x['timestamp_orden'] else datetime.min, 
+                reverse=True
+            )
+            
+            # 4. Remover el campo temporal de ordenamiento
+            for item in historial_combinado:
+                del item['timestamp_orden']
+            
             return {
-                "historial": historial,
-                "fuente": "oracle",
-                "umbral_actual": ml.umbral_global
+                "historial": historial_combinado,
+                "fuente": "oracle_combinado",
+                "umbral_actual": ml.umbral_global,
+                "total_cambios": len(historial_combinado)
             }
             
     except Exception as e:
-        logger.error(f"Error obteniendo historial: {e}")
+        logger.error(f"Error obteniendo historial combinado: {e}")
+        return {
+            "historial": [],
+            "fuente": "error",
+            "umbral_actual": ml.umbral_global,
+            "error": str(e)
+        }
+
+@router.get("/lotes/{lote_id}/estado", tags=["Scoring"])
+async def obtener_estado_lote(lote_id: int):
+    """
+    Consulta el estado actual de un lote en procesamiento
+    """
+    if not oracle.oracle_pool:
+        raise HTTPException(status_code=503, detail="Oracle no disponible")
+    
+    try:
+        with get_oracle_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT 
+                    ID_LOTE, ESTADO, TOTAL_REGISTROS, TOTAL_ANOMALIAS, 
+                    TASA_ANOMALIAS, TIMESTAMP_INICIO, TIMESTAMP_FIN, MENSAJE_ERROR
+                FROM LOTES_PROCESAMIENTO
+                WHERE ID_LOTE = :lote_id
+            """, [lote_id])
+            
+            row = cursor.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Lote no encontrado")
+            
+            return {
+                "lote_id": row[0],
+                "estado": row[1],
+                "total_registros": row[2] or 0,
+                "total_anomalias": row[3] or 0,
+                "tasa_anomalias": row[4] or 0,
+                "timestamp_inicio": row[5].isoformat() if row[5] else None,
+                "timestamp_fin": row[6].isoformat() if row[6] else None,
+                "mensaje_error": row[7],
+                "completado": row[1] in ['COMPLETADO', 'ERROR']
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error consultando estado de lote: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-# ## 8. ENDPOINTS DE ANÁLISIS Y REPORTES
-
-# In[15]:
+@router.get("/modelo/actualizacion-diaria/estado", tags=["Modelo"])
+async def obtener_estado_actualizacion():
+    """
+    Consulta el estado de la última actualización diaria
+    """
+    if not oracle.oracle_pool:
+        raise HTTPException(status_code=503, detail="Oracle no disponible")
+    
+    try:
+        with get_oracle_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT 
+                    ID_ACTUALIZACION, FECHA_EJECUCION, ESTADO, 
+                    TOTAL_REGISTROS, REGISTROS_PROCESADOS,
+                    UMBRAL_ANTERIOR, UMBRAL_NUEVO, 
+                    TIEMPO_PROCESAMIENTO_SEG, MENSAJE_ERROR
+                FROM ACTUALIZACION_DIARIA_UMBRAL
+                WHERE FECHA_EJECUCION >= SYSDATE - 1
+                ORDER BY FECHA_EJECUCION DESC
+                FETCH FIRST 1 ROW ONLY
+            """)
+            
+            row = cursor.fetchone()
+            if not row:
+                return {
+                    "estado": "SIN_ACTUALIZACIONES",
+                    "mensaje": "No hay actualizaciones recientes"
+                }
+            
+            return {
+                "id_actualizacion": row[0],
+                "fecha_ejecucion": row[1].isoformat() if row[1] else None,
+                "estado": row[2],
+                "total_registros": row[3] or 0,
+                "registros_procesados": row[4] or 0,
+                "umbral_anterior": float(row[5]) if row[5] else None,
+                "umbral_nuevo": float(row[6]) if row[6] else None,
+                "tiempo_procesamiento": float(row[7]) if row[7] else None,
+                "mensaje_error": row[8],
+                "completado": row[2] in ['COMPLETADO', 'ERROR'],
+                "progreso": (row[4] / max(row[3], 1)) * 100 if row[3] and row[4] else 0
+            }
+            
+    except Exception as e:
+        logger.error(f"Error consultando estado de actualización: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/analisis/resumen-diario", tags=["Análisis"])
@@ -1099,57 +1776,51 @@ async def resumen_diario(fecha: str = Query(..., description="Fecha en formato Y
         logger.error(f"Error generando resumen diario: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @router.get("/analisis/tendencias", tags=["Análisis"])
-async def obtener_tendencias(dias: int = Query(7, description="Número de días a analizar")):
-    """
-    Obtiene las tendencias de anomalías de los últimos N días
-    """
+async def obtener_tendencias_fraude(
+    dias: int = Query(default=7, description="Número de días a analizar")
+):
+    """Obtiene tendencias de fraude para los últimos N días desde BD"""
+    if not oracle.oracle_pool:
+        raise HTTPException(status_code=503, detail="Oracle no disponible")
+        
     try:
-        fecha_fin = datetime.now()
-        fecha_inicio = fecha_fin - timedelta(days=dias)
-        tendencias = []
-
-        for i in range(dias):
-            fecha_i = fecha_inicio + timedelta(days=i)
-            archivos = [
-                f for f in os.listdir(ml.OUTPUT_PATH)
-                if f.startswith("resultados_") and fecha_i.strftime("%Y%m%d") in f
-            ]
-
-            if archivos:
-                dfs = [pd.read_csv(str(ml.OUTPUT_PATH / f)) for f in archivos]
-                df_dia = pd.concat(dfs, ignore_index=True)
-                anom_count = int(df_dia['es_anomalia'].sum())
-                tasas = round(df_dia['es_anomalia'].mean() * 100, 2) if len(df_dia) > 0 else 0
-                registros = len(df_dia)
-            else:
-                anom_count = 0
-                tasas = 0
-                registros = 0
-
-            tendencias.append({
-                "fecha": fecha_i.strftime("%Y-%m-%d"),
-                "registros": registros,
-                "anomalias": anom_count,
-                "tasa": tasas
-            })
-
-        registros_totales = sum(t['registros'] for t in tendencias)
-        anom_totales = sum(t['anomalias'] for t in tendencias)
-
-        return {
-            "periodo": f"Últimos {dias} días",
-            "fecha_inicio": fecha_inicio.strftime("%Y-%m-%d"),
-            "fecha_fin": fecha_fin.strftime("%Y-%m-%d"),
-            "tendencias": tendencias,
-            "resumen": {
-                "registros_totales": registros_totales,
-                "anomalias_totales": anom_totales,
-                "tasa_promedio": round(anom_totales / registros_totales * 100, 2) if registros_totales > 0 else 0
-            }
-        }
-
+        with oracle.get_oracle_connection() as conn:
+            cursor = conn.cursor()
+            
+            query = """
+            SELECT 
+                TRUNC(FECHA_PROCESAMIENTO) as FECHA,
+                COUNT(*) as ANOMALIAS
+            FROM ALERTAS_FRAUDE
+            WHERE FECHA_PROCESAMIENTO >= SYSDATE - :dias
+            GROUP BY TRUNC(FECHA_PROCESAMIENTO)
+            ORDER BY FECHA DESC
+            """
+            
+            cursor.execute(query, [dias])
+            
+            tendencias = []
+            for row in cursor:
+                # Obtener total de registros procesados ese día
+                cursor_total = conn.cursor()
+                cursor_total.execute("""
+                    SELECT SUM(TOTAL_REGISTROS) as TOTAL
+                    FROM LOTES_PROCESAMIENTO
+                    WHERE TRUNC(TIMESTAMP_INICIO) = :fecha
+                """, [row[0]])
+                total_row = cursor_total.fetchone()
+                total = total_row[0] if total_row and total_row[0] else 0
+                
+                tendencias.append({
+                    "fecha": row[0].strftime('%Y-%m-%d'),
+                    "anomalias": row[1],
+                    "total": total,
+                    "tasa": round((row[1] / total * 100) if total > 0 else 0, 2)
+                })
+                
+        return {"tendencias": tendencias}
+        
     except Exception as e:
         logger.error(f"Error obteniendo tendencias: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1157,49 +1828,97 @@ async def obtener_tendencias(dias: int = Query(7, description="Número de días 
 
 @router.get("/analisis/exportar-anomalias", tags=["Análisis"])
 async def exportar_anomalias(
-    fecha_inicio: str = Query(..., description="Fecha inicio YYYY-MM-DD"),
-    fecha_fin: str    = Query(..., description="Fecha fin YYYY-MM-DD")
+    formato: str = Query("csv", description="Formato de exportación: csv o excel"),
+    fecha_inicio: Optional[str] = Query(None, description="Fecha inicio YYYY-MM-DD"),
+    fecha_fin: Optional[str] = Query(None, description="Fecha fin YYYY-MM-DD"),
+    limite: int = Query(10000, description="Límite de registros")
 ):
-    """
-    Exporta todas las anomalías detectadas en un rango de fechas
-    """
+    """Exporta las anomalías detectadas en formato CSV o Excel desde BD"""
+    if not oracle.oracle_pool:
+        raise HTTPException(status_code=503, detail="Oracle no disponible")
+        
     try:
-        # Convertir fechas
-        inicio = datetime.strptime(fecha_inicio, "%Y-%m-%d")
-        fin    = datetime.strptime(fecha_fin,    "%Y-%m-%d")
-
-        if inicio > fin:
-            raise HTTPException(status_code=400, detail="Fecha inicio debe ser anterior a fecha fin")
-
-        anomalias_totales = []
-        for archivo in os.listdir(ml.OUTPUT_PATH):
-            if archivo.startswith("resultados_"):
-                fecha_arch = archivo.split("_")[2][:8]
-                try:
-                    fecha_obj = datetime.strptime(fecha_arch, "%Y%m%d")
-                except ValueError:
-                    continue
-
-                if inicio <= fecha_obj <= fin:
-                    df = pd.read_csv(str(ml.OUTPUT_PATH / archivo))
-                    anomalias_totales.append(df[df['es_anomalia'] == True])
-
-        if not anomalias_totales:
-            return {
-                "mensaje": "No se encontraron anomalías en el rango especificado",
-                "fecha_inicio": fecha_inicio,
-                "fecha_fin": fecha_fin
-            }
-
-        # Combinar y exportar
-        df_out = pd.concat(anomalias_totales, ignore_index=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = str(ml.OUTPUT_PATH / f"exportacion_anomalias_{timestamp}.csv")
-        df_out.to_csv(out_path, index=False)
-
-        return FileResponse(out_path, media_type="text/csv",
-                            filename=f"anomalias_{fecha_inicio}_{fecha_fin}.csv")
-
+        with oracle.get_oracle_connection() as conn:
+            # Construir query con filtros
+            where_clause = "WHERE 1=1"
+            params = {"limite": limite}
+            
+            if fecha_inicio:
+                where_clause += " AND FECHA_PROCESAMIENTO >= TO_DATE(:fecha_inicio, 'YYYY-MM-DD')"
+                params['fecha_inicio'] = fecha_inicio
+            if fecha_fin:
+                where_clause += " AND FECHA_PROCESAMIENTO <= TO_DATE(:fecha_fin, 'YYYY-MM-DD') + 1"
+                params['fecha_fin'] = fecha_fin
+                
+            query = f"""
+            SELECT 
+                ID_ALERTA,
+                TO_CHAR(FECHA_PROCESAMIENTO, 'YYYY-MM-DD HH24:MI:SS') as FECHA_PROCESAMIENTO,
+                FECHA_REGISTRO,
+                CODIGO_PAIS,
+                LINEA,
+                N_LLAMADAS,
+                N_MINUTOS,
+                N_DESTINOS,
+                SCORE_ANOMALIA,
+                UMBRAL,
+                TIPO_ANOMALIA,
+                TIPO_CONTEXTO,
+                RAZON_DECISION,
+                ARCHIVO_ORIGEN,
+                LOTE_PROCESAMIENTO
+            FROM ALERTAS_FRAUDE
+            {where_clause}
+            ORDER BY FECHA_PROCESAMIENTO DESC
+            FETCH FIRST :limite ROWS ONLY
+            """
+            
+            # Leer datos con pandas
+            df = pd.read_sql(query, conn, params=params)
+            
+            # Generar archivo según formato
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            
+            if formato.lower() == "excel":
+                output_path = ml.TEMP_PATH / f"anomalias_export_{timestamp}.xlsx"
+                with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                    df.to_excel(writer, sheet_name='Anomalías', index=False)
+                    
+                    # Agregar hoja de resumen
+                    resumen = pd.DataFrame({
+                        'Métrica': [
+                            'Total Anomalías',
+                            'Países Únicos',
+                            'Líneas Únicas',
+                            'Score Promedio',
+                            'Total Llamadas',
+                            'Total Minutos'
+                        ],
+                        'Valor': [
+                            len(df),
+                            df['CODIGO_PAIS'].nunique(),
+                            df['LINEA'].nunique(),
+                            df['SCORE_ANOMALIA'].mean(),
+                            df['N_LLAMADAS'].sum(),
+                            df['N_MINUTOS'].sum()
+                        ]
+                    })
+                    resumen.to_excel(writer, sheet_name='Resumen', index=False)
+                    
+                content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                filename = f"anomalias_{timestamp}.xlsx"
+            else:
+                output_path = ml.TEMP_PATH / f"anomalias_export_{timestamp}.csv"
+                df.to_csv(output_path, index=False, encoding='utf-8-sig')
+                content_type = "text/csv"
+                filename = f"anomalias_{timestamp}.csv"
+            
+            return FileResponse(
+                path=output_path,
+                media_type=content_type,
+                filename=filename
+            )
+            
     except Exception as e:
         logger.error(f"Error exportando anomalías: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1215,40 +1934,62 @@ async def verificar_salud():
     """
     Verifica el estado de salud del sistema
     """
+    if not oracle.oracle_pool:
+        return EstadoSistema(
+            estado="oracle no disponible",
+            modelo_cargado=bool(ml.modelo),
+            ultimo_procesamiento=None,
+            registros_procesados_hoy=0,
+            anomalias_detectadas_hoy=0,
+            espacio_disco_gb=0
+        )
+
     try:
-        # Calcular estadísticas del día
-        hoy = datetime.now().strftime("%Y%m%d")
-        registros_hoy = 0
-        anomalias_hoy = 0
-        for archivo in os.listdir(ml.OUTPUT_PATH):
-            if archivo.startswith("resultados_") and hoy in archivo:
-                df = pd.read_csv(str(ml.OUTPUT_PATH / archivo))
-                registros_hoy += len(df)
-                anomalias_hoy += int(df['es_anomalia'].sum())
+        # Calcular estadísticas del día desde Oracle
+        hoy = datetime.now().date()
+        
+        with get_oracle_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Registros procesados hoy
+            cursor.execute("""
+                SELECT COALESCE(SUM(TOTAL_REGISTROS), 0) as total_registros
+                FROM LOTES_PROCESAMIENTO
+                WHERE TRUNC(TIMESTAMP_INICIO) = TRUNC(SYSDATE)
+                AND ESTADO = 'COMPLETADO'
+            """)
+            registros_hoy = cursor.fetchone()[0] or 0
+            
+            # Anomalías detectadas hoy
+            cursor.execute("""
+                SELECT COUNT(*) as total_anomalias
+                FROM ALERTAS_FRAUDE
+                WHERE TRUNC(FECHA_PROCESAMIENTO) = TRUNC(SYSDATE)
+            """)
+            anomalias_hoy = cursor.fetchone()[0] or 0
+            
+            # Último procesamiento
+            cursor.execute("""
+                SELECT MAX(TIMESTAMP_INICIO) as ultimo
+                FROM LOTES_PROCESAMIENTO
+                WHERE ESTADO = 'COMPLETADO'
+            """)
+            ultimo_row = cursor.fetchone()
+            ultimo_procesamiento = ultimo_row[0] if ultimo_row and ultimo_row[0] else None
 
         # Espacio en disco
-        stat = shutil.disk_usage(ml.OUTPUT_PATH)
-        espacio_gb = stat.free / (1024**3)
-
-        # Último procesamiento
-        archivos = [f for f in os.listdir(ml.OUTPUT_PATH) if f.startswith("resultados_")]
-        ultimo_procesamiento = None
-        if archivos:
-            ultimo_archivo = max(archivos)
-            # Extraer timestamp del nombre del archivo
-            try:
-                parts = ultimo_archivo.split("_")
-                timestamp_str = parts[2] + parts[3].replace(".csv", "")
-                ultimo_procesamiento = datetime.strptime(timestamp_str, "%Y%m%d%H%M%S")
-            except:
-                pass
+        try:
+            stat = shutil.disk_usage(ml.TEMP_PATH)  # Usar TEMP_PATH en lugar de OUTPUT_PATH
+            espacio_gb = stat.free / (1024**3)
+        except:
+            espacio_gb = 0
 
         return EstadoSistema(
             estado="saludable" if ml.modelo else "modelo no cargado",
             modelo_cargado=bool(ml.modelo),
             ultimo_procesamiento=ultimo_procesamiento,
-            registros_procesados_hoy=registros_hoy,
-            anomalias_detectadas_hoy=anomalias_hoy,
+            registros_procesados_hoy=int(registros_hoy),
+            anomalias_detectadas_hoy=int(anomalias_hoy),
             espacio_disco_gb=round(espacio_gb, 2)
         )
 
@@ -1256,13 +1997,94 @@ async def verificar_salud():
         logger.error(f"Error verificando salud: {e}")
         return EstadoSistema(
             estado="error",
-            modelo_cargado=False,
+            modelo_cargado=bool(ml.modelo),
             ultimo_procesamiento=None,
             registros_procesados_hoy=0,
             anomalias_detectadas_hoy=0,
             espacio_disco_gb=0
         )
 
+@router.get("/dashboard/estadisticas-comparativas", tags=["Dashboard"])
+async def obtener_estadisticas_comparativas():
+    """
+    Obtiene estadísticas del día actual vs día anterior para mostrar cambios porcentuales
+    """
+    if not oracle.oracle_pool:
+        raise HTTPException(status_code=503, detail="Oracle no disponible")
+    
+    try:
+        with get_oracle_connection() as conn:
+            cursor = conn.cursor()
+            
+            # 1. Registros procesados HOY
+            cursor.execute("""
+                SELECT COALESCE(SUM(TOTAL_REGISTROS), 0) as registros_hoy
+                FROM LOTES_PROCESAMIENTO
+                WHERE TRUNC(TIMESTAMP_INICIO) = TRUNC(SYSDATE)
+                AND ESTADO = 'COMPLETADO'
+            """)
+            registros_hoy = cursor.fetchone()[0] or 0
+            
+            # 2. Anomalías detectadas HOY
+            cursor.execute("""
+                SELECT COUNT(*) as anomalias_hoy
+                FROM ALERTAS_FRAUDE
+                WHERE TRUNC(FECHA_PROCESAMIENTO) = TRUNC(SYSDATE)
+            """)
+            anomalias_hoy = cursor.fetchone()[0] or 0
+            
+            # 3. Registros procesados AYER
+            cursor.execute("""
+                SELECT COALESCE(SUM(TOTAL_REGISTROS), 0) as registros_ayer
+                FROM LOTES_PROCESAMIENTO
+                WHERE TRUNC(TIMESTAMP_INICIO) = TRUNC(SYSDATE-1)
+                AND ESTADO = 'COMPLETADO'
+            """)
+            registros_ayer = cursor.fetchone()[0] or 0
+            
+            # 4. Anomalías detectadas AYER
+            cursor.execute("""
+                SELECT COUNT(*) as anomalias_ayer
+                FROM ALERTAS_FRAUDE
+                WHERE TRUNC(FECHA_PROCESAMIENTO) = TRUNC(SYSDATE-1)
+            """)
+            anomalias_ayer = cursor.fetchone()[0] or 0
+            
+            # 5. Calcular cambios porcentuales
+            cambio_registros = 0
+            if registros_ayer > 0:
+                cambio_registros = ((registros_hoy - registros_ayer) / registros_ayer) * 100
+            
+            cambio_anomalias = 0
+            if anomalias_ayer > 0:
+                cambio_anomalias = ((anomalias_hoy - anomalias_ayer) / anomalias_ayer) * 100
+            
+            # 6. Calcular tasas de fraude
+            tasa_hoy = 0
+            if registros_hoy > 0:
+                tasa_hoy = (anomalias_hoy / registros_hoy) * 100
+                
+            tasa_ayer = 0
+            if registros_ayer > 0:
+                tasa_ayer = (anomalias_ayer / registros_ayer) * 100
+            
+            cambio_tasa = tasa_hoy - tasa_ayer
+            
+            return {
+                "registros_hoy": int(registros_hoy),
+                "anomalias_hoy": int(anomalias_hoy),
+                "registros_ayer": int(registros_ayer),
+                "anomalias_ayer": int(anomalias_ayer),
+                "tasa_fraude_hoy": round(float(tasa_hoy), 2),
+                "tasa_fraude_ayer": round(float(tasa_ayer), 2),
+                "cambio_registros": round(float(cambio_registros), 1),
+                "cambio_anomalias": round(float(cambio_anomalias), 1),
+                "cambio_tasa": round(float(cambio_tasa), 1)
+            }
+            
+    except Exception as e:
+        logger.error(f"Error obteniendo estadísticas comparativas: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/logs/recientes", tags=["Monitoreo"])
 async def obtener_logs_recientes(limite: int = Query(100, description="Número de logs a retornar")):

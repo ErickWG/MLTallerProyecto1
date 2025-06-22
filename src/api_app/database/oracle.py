@@ -207,6 +207,7 @@ def registrar_lote_procesamiento(
                 :1, :2, :3, :4, :5, :6, :7, :8
             ) RETURNING ID_LOTE INTO :id_lote
         """
+        # CAMBIO: usar oracledb.NUMBER directamente
         id_lote = cursor.var(oracledb.NUMBER)
         cursor.execute(
             insert_sql,

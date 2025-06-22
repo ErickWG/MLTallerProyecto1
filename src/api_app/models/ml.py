@@ -10,11 +10,10 @@ logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 MODELS_PATH = BASE_DIR / "Modelos"
-OUTPUT_PATH = BASE_DIR / "Resultados_API"
 TEMP_PATH = BASE_DIR / "Temp_API"
 LOG_PATH = BASE_DIR / "Logs_API"
 
-for path in [OUTPUT_PATH, TEMP_PATH, LOG_PATH]:
+for path in [TEMP_PATH, LOG_PATH]:
     path.mkdir(parents=True, exist_ok=True)
 
 modelo = None
