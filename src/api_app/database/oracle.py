@@ -190,11 +190,11 @@ def guardar_anomalias_oracle(anomalias_df, archivo_origen, lote_id):
 
 def registrar_lote_procesamiento(
     archivo_entrada,
-    total_registros,
-    total_anomalias,
-    tasa_anomalias,
-    archivo_salida,
-    estado="COMPLETADO",
+    total_registros=0,  # Cambiar a 0 por defecto
+    total_anomalias=0,  # Cambiar a 0 por defecto  
+    tasa_anomalias=0,   # Cambiar a 0 por defecto
+    archivo_salida=None,
+    estado="EN_PROCESO",  # CAMBIO: Empezar como EN_PROCESO
 ):
     """Registra información del lote procesado"""
     with get_oracle_connection() as conn:
@@ -207,13 +207,12 @@ def registrar_lote_procesamiento(
                 :1, :2, :3, :4, :5, :6, :7, :8
             ) RETURNING ID_LOTE INTO :id_lote
         """
-        # CAMBIO: usar oracledb.NUMBER directamente
         id_lote = cursor.var(oracledb.NUMBER)
         cursor.execute(
             insert_sql,
             [
                 datetime.now(),
-                datetime.now(),
+                None,  # CAMBIO: TIMESTAMP_FIN debe ser None al inicio
                 archivo_entrada,
                 total_registros,
                 total_anomalias,
@@ -225,4 +224,89 @@ def registrar_lote_procesamiento(
         )
         conn.commit()
         return id_lote.getvalue()[0]
+    
+def actualizar_lote_procesamiento(
+    lote_id,
+    total_registros=None,
+    total_anomalias=None,
+    tasa_anomalias=None,
+    archivo_salida=None,
+    estado=None,
+    mensaje_error=None
+):
+    """Actualiza información del lote procesado"""
+    with get_oracle_connection() as conn:
+        cursor = conn.cursor()
+        
+        # Construir UPDATE dinámicamente
+        campos = []
+        valores = []
+        
+        if total_registros is not None:
+            campos.append("TOTAL_REGISTROS = :reg")
+            valores.append(("reg", total_registros))
+            
+        if total_anomalias is not None:
+            campos.append("TOTAL_ANOMALIAS = :anom")
+            valores.append(("anom", total_anomalias))
+            
+        if tasa_anomalias is not None:
+            campos.append("TASA_ANOMALIAS = :tasa")
+            valores.append(("tasa", tasa_anomalias))
+            
+        if archivo_salida is not None:
+            campos.append("ARCHIVO_SALIDA = :archivo")
+            valores.append(("archivo", archivo_salida))
+            
+        if estado is not None:
+            campos.append("ESTADO = :estado")
+            valores.append(("estado", estado))
+            
+        if mensaje_error is not None:
+            campos.append("MENSAJE_ERROR = :error")
+            valores.append(("error", mensaje_error))
+            
+        # Siempre actualizar timestamp_fin si se pasa estado final
+        if estado in ['COMPLETADO', 'ERROR']:
+            campos.append("TIMESTAMP_FIN = :fin")
+            valores.append(("fin", datetime.now()))
+        
+        if campos:
+            update_sql = f"""
+                UPDATE LOTES_PROCESAMIENTO 
+                SET {', '.join(campos)}
+                WHERE ID_LOTE = :lote_id
+            """
+            
+            # Crear diccionario de parámetros
+            params = {nombre: valor for nombre, valor in valores}
+            params['lote_id'] = lote_id
+            
+            cursor.execute(update_sql, params)
+            conn.commit()
+            logger.info(f"Lote {lote_id} actualizado con estado: {estado}")
 
+def actualizar_progreso_actualizacion_diaria(id_actualizacion, registros_procesados, progreso_porcentaje=None):
+    """Actualiza el progreso de la actualización diaria en tiempo real"""
+    with get_oracle_connection() as conn:
+        cursor = conn.cursor()
+        
+        if progreso_porcentaje is not None:
+            cursor.execute("""
+                UPDATE ACTUALIZACION_DIARIA_UMBRAL 
+                SET REGISTROS_PROCESADOS = :1,
+                    OBSERVACIONES = :2
+                WHERE ID_ACTUALIZACION = :3
+            """, [
+                registros_procesados,
+                f"Progreso: {progreso_porcentaje:.1f}% - {registros_procesados} registros procesados",
+                id_actualizacion
+            ])
+        else:
+            cursor.execute("""
+                UPDATE ACTUALIZACION_DIARIA_UMBRAL 
+                SET REGISTROS_PROCESADOS = :1
+                WHERE ID_ACTUALIZACION = :2
+            """, [registros_procesados, id_actualizacion])
+        
+        conn.commit()
