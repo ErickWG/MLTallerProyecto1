@@ -286,12 +286,14 @@ async def obtener_detalle_alerta(id_alerta: int):
 
             cursor.execute("""
                 SELECT 
-                    ID_ALERTA, FECHA_PROCESAMIENTO, FECHA_REGISTRO, CODIGO_PAIS, 
-                    LINEA, N_LLAMADAS, N_MINUTOS, N_DESTINOS, SCORE_ANOMALIA,
-                    UMBRAL, TIPO_ANOMALIA, TIPO_CONTEXTO, RAZON_DECISION,
-                    ARCHIVO_ORIGEN, LOTE_PROCESAMIENTO
-                FROM ALERTAS_FRAUDE
-                WHERE ID_ALERTA = :id_alerta
+                    af.ID_ALERTA, af.FECHA_PROCESAMIENTO, af.FECHA_REGISTRO, af.CODIGO_PAIS,
+                    INITCAP(COALESCE(cp.DESCRIPCION_PAIS, 'País ' || af.CODIGO_PAIS)) as NOMBRE_PAIS,
+                    af.LINEA, af.N_LLAMADAS, af.N_MINUTOS, af.N_DESTINOS, af.SCORE_ANOMALIA,
+                    af.UMBRAL, af.TIPO_ANOMALIA, af.TIPO_CONTEXTO, af.RAZON_DECISION,
+                    af.ARCHIVO_ORIGEN, af.LOTE_PROCESAMIENTO
+                FROM ALERTAS_FRAUDE af
+                LEFT JOIN CODIGO_PAISES cp ON af.CODIGO_PAIS = cp.CODIGO_PAIS
+                WHERE af.ID_ALERTA = :id_alerta
             """, [id_alerta])
 
             row = cursor.fetchone()
@@ -397,12 +399,14 @@ async def consultar_alertas(
         with get_oracle_connection() as conn:
             cursor = conn.cursor()
 
-            # Construir query dinámicamente
+            # Construir query dinámicamente - MODIFICAR ESTA SECCIÓN
             query = """
-                SELECT ID_ALERTA, FECHA_PROCESAMIENTO, FECHA_REGISTRO, CODIGO_PAIS, 
-                       LINEA, N_LLAMADAS, N_MINUTOS, N_DESTINOS, SCORE_ANOMALIA,
-                       UMBRAL, TIPO_ANOMALIA, TIPO_CONTEXTO, RAZON_DECISION
-                FROM ALERTAS_FRAUDE
+                SELECT af.ID_ALERTA, af.FECHA_PROCESAMIENTO, af.FECHA_REGISTRO, af.CODIGO_PAIS,
+                    INITCAP(COALESCE(cp.DESCRIPCION_PAIS, 'País ' || af.CODIGO_PAIS)) as NOMBRE_PAIS,
+                    af.LINEA, af.N_LLAMADAS, af.N_MINUTOS, af.N_DESTINOS, af.SCORE_ANOMALIA,
+                    af.UMBRAL, af.TIPO_ANOMALIA, af.TIPO_CONTEXTO, af.RAZON_DECISION
+                FROM ALERTAS_FRAUDE af
+                LEFT JOIN CODIGO_PAISES cp ON af.CODIGO_PAIS = cp.CODIGO_PAIS
                 WHERE 1=1
             """
             params = []
@@ -449,102 +453,6 @@ async def consultar_alertas(
         logger.error(f"Error consultando alertas: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/alertas/estadisticas", tags=["Alertas Oracle"])
-async def estadisticas_alertas(
-    fecha_inicio: str = Query(..., description="Fecha inicio YYYY-MM-DD"),
-    fecha_fin: str = Query(..., description="Fecha fin YYYY-MM-DD")
-):
-    """
-    Obtiene estadísticas de las alertas en un rango de fechas
-    """
-    if not oracle.oracle_pool:
-        raise HTTPException(status_code=503, detail="Oracle no disponible")
-
-    try:
-        with get_oracle_connection() as conn:
-            cursor = conn.cursor()
-
-            # Estadísticas generales
-            cursor.execute("""
-                SELECT 
-                    COUNT(*) as total_alertas,
-                    COUNT(DISTINCT CODIGO_PAIS) as paises_afectados,
-                    COUNT(DISTINCT LINEA) as lineas_afectadas,
-                    AVG(SCORE_ANOMALIA) as score_promedio,
-                    MAX(SCORE_ANOMALIA) as score_maximo
-                FROM ALERTAS_FRAUDE
-                WHERE FECHA_PROCESAMIENTO >= TO_DATE(:1, 'YYYY-MM-DD')
-                  AND FECHA_PROCESAMIENTO <= TO_DATE(:2, 'YYYY-MM-DD') + 1
-            """, [fecha_inicio, fecha_fin])
-
-            stats_generales = dict(zip(
-                ['total_alertas', 'paises_afectados', 'lineas_afectadas', 
-                 'score_promedio', 'score_maximo'],
-                cursor.fetchone()
-            ))
-
-            # Distribución por tipo
-            cursor.execute("""
-                SELECT TIPO_ANOMALIA, COUNT(*) as cantidad
-                FROM ALERTAS_FRAUDE
-                WHERE FECHA_PROCESAMIENTO >= TO_DATE(:1, 'YYYY-MM-DD')
-                  AND FECHA_PROCESAMIENTO <= TO_DATE(:2, 'YYYY-MM-DD') + 1
-                GROUP BY TIPO_ANOMALIA
-                ORDER BY cantidad DESC
-            """, [fecha_inicio, fecha_fin])
-
-            distribucion_tipos = [
-                {"tipo": row[0], "cantidad": row[1]}
-                for row in cursor.fetchall()
-            ]
-
-            # Top países
-            cursor.execute("""
-                SELECT CODIGO_PAIS, COUNT(*) as cantidad
-                FROM ALERTAS_FRAUDE
-                WHERE FECHA_PROCESAMIENTO >= TO_DATE(:1, 'YYYY-MM-DD')
-                  AND FECHA_PROCESAMIENTO <= TO_DATE(:2, 'YYYY-MM-DD') + 1
-                GROUP BY CODIGO_PAIS
-                ORDER BY cantidad DESC
-                FETCH FIRST 10 ROWS ONLY
-            """, [fecha_inicio, fecha_fin])
-
-            top_paises = [
-                {"codigo_pais": row[0], "cantidad": row[1]}
-                for row in cursor.fetchall()
-            ]
-
-            # Tendencia diaria
-            cursor.execute("""
-                SELECT 
-                    TO_CHAR(FECHA_PROCESAMIENTO, 'YYYY-MM-DD') as fecha,
-                    COUNT(*) as cantidad
-                FROM ALERTAS_FRAUDE
-                WHERE FECHA_PROCESAMIENTO >= TO_DATE(:1, 'YYYY-MM-DD')
-                  AND FECHA_PROCESAMIENTO <= TO_DATE(:2, 'YYYY-MM-DD') + 1
-                GROUP BY TO_CHAR(FECHA_PROCESAMIENTO, 'YYYY-MM-DD')
-                ORDER BY fecha
-            """, [fecha_inicio, fecha_fin])
-
-            tendencia_diaria = [
-                {"fecha": row[0], "cantidad": row[1]}
-                for row in cursor.fetchall()
-            ]
-
-            return {
-                "periodo": {
-                    "fecha_inicio": fecha_inicio,
-                    "fecha_fin": fecha_fin
-                },
-                "estadisticas_generales": stats_generales,
-                "distribucion_tipos": distribucion_tipos,
-                "top_paises": top_paises,
-                "tendencia_diaria": tendencia_diaria
-            }
-
-    except Exception as e:
-        logger.error(f"Error obteniendo estadísticas: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/lotes/historial", tags=["Alertas Oracle"])
 async def historial_lotes(limite: int = Query(50, description="Número de lotes a mostrar")):
@@ -1580,155 +1488,7 @@ async def resumen_diario(fecha: str = Query(..., description="Fecha en formato Y
     except Exception as e:
         logger.error(f"Error generando resumen diario: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/analisis/tendencias", tags=["Análisis"])
-async def obtener_tendencias_fraude(
-    dias: int = Query(default=7, description="Número de días a analizar")
-):
-    """Obtiene tendencias de fraude para los últimos N días desde BD"""
-    if not oracle.oracle_pool:
-        raise HTTPException(status_code=503, detail="Oracle no disponible")
-        
-    try:
-        with oracle.get_oracle_connection() as conn:
-            cursor = conn.cursor()
-            
-            query = """
-            SELECT 
-                TRUNC(FECHA_PROCESAMIENTO) as FECHA,
-                COUNT(*) as ANOMALIAS
-            FROM ALERTAS_FRAUDE
-            WHERE FECHA_PROCESAMIENTO >= SYSDATE - :dias
-            GROUP BY TRUNC(FECHA_PROCESAMIENTO)
-            ORDER BY FECHA DESC
-            """
-            
-            cursor.execute(query, [dias])
-            
-            tendencias = []
-            for row in cursor:
-                # Obtener total de registros procesados ese día
-                cursor_total = conn.cursor()
-                cursor_total.execute("""
-                    SELECT SUM(TOTAL_REGISTROS) as TOTAL
-                    FROM LOTES_PROCESAMIENTO
-                    WHERE TRUNC(TIMESTAMP_INICIO) = :fecha
-                """, [row[0]])
-                total_row = cursor_total.fetchone()
-                total = total_row[0] if total_row and total_row[0] else 0
-                
-                tendencias.append({
-                    "fecha": row[0].strftime('%Y-%m-%d'),
-                    "anomalias": row[1],
-                    "total": total,
-                    "tasa": round((row[1] / total * 100) if total > 0 else 0, 2)
-                })
-                
-        return {"tendencias": tendencias}
-        
-    except Exception as e:
-        logger.error(f"Error obteniendo tendencias: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/analisis/exportar-anomalias", tags=["Análisis"])
-async def exportar_anomalias(
-    formato: str = Query("csv", description="Formato de exportación: csv o excel"),
-    fecha_inicio: Optional[str] = Query(None, description="Fecha inicio YYYY-MM-DD"),
-    fecha_fin: Optional[str] = Query(None, description="Fecha fin YYYY-MM-DD"),
-    limite: int = Query(10000, description="Límite de registros")
-):
-    """Exporta las anomalías detectadas en formato CSV o Excel desde BD"""
-    if not oracle.oracle_pool:
-        raise HTTPException(status_code=503, detail="Oracle no disponible")
-        
-    try:
-        with oracle.get_oracle_connection() as conn:
-            # Construir query con filtros
-            where_clause = "WHERE 1=1"
-            params = {"limite": limite}
-            
-            if fecha_inicio:
-                where_clause += " AND FECHA_PROCESAMIENTO >= TO_DATE(:fecha_inicio, 'YYYY-MM-DD')"
-                params['fecha_inicio'] = fecha_inicio
-            if fecha_fin:
-                where_clause += " AND FECHA_PROCESAMIENTO <= TO_DATE(:fecha_fin, 'YYYY-MM-DD') + 1"
-                params['fecha_fin'] = fecha_fin
-                
-            query = f"""
-            SELECT 
-                ID_ALERTA,
-                TO_CHAR(FECHA_PROCESAMIENTO, 'YYYY-MM-DD HH24:MI:SS') as FECHA_PROCESAMIENTO,
-                FECHA_REGISTRO,
-                CODIGO_PAIS,
-                LINEA,
-                N_LLAMADAS,
-                N_MINUTOS,
-                N_DESTINOS,
-                SCORE_ANOMALIA,
-                UMBRAL,
-                TIPO_ANOMALIA,
-                TIPO_CONTEXTO,
-                RAZON_DECISION,
-                ARCHIVO_ORIGEN,
-                LOTE_PROCESAMIENTO
-            FROM ALERTAS_FRAUDE
-            {where_clause}
-            ORDER BY FECHA_PROCESAMIENTO DESC
-            FETCH FIRST :limite ROWS ONLY
-            """
-            
-            # Leer datos con pandas
-            df = pd.read_sql(query, conn, params=params)
-            
-            # Generar archivo según formato
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            
-            if formato.lower() == "excel":
-                output_path = ml.TEMP_PATH / f"anomalias_export_{timestamp}.xlsx"
-                with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-                    df.to_excel(writer, sheet_name='Anomalías', index=False)
-                    
-                    # Agregar hoja de resumen
-                    resumen = pd.DataFrame({
-                        'Métrica': [
-                            'Total Anomalías',
-                            'Países Únicos',
-                            'Líneas Únicas',
-                            'Score Promedio',
-                            'Total Llamadas',
-                            'Total Minutos'
-                        ],
-                        'Valor': [
-                            len(df),
-                            df['CODIGO_PAIS'].nunique(),
-                            df['LINEA'].nunique(),
-                            df['SCORE_ANOMALIA'].mean(),
-                            df['N_LLAMADAS'].sum(),
-                            df['N_MINUTOS'].sum()
-                        ]
-                    })
-                    resumen.to_excel(writer, sheet_name='Resumen', index=False)
-                    
-                content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                filename = f"anomalias_{timestamp}.xlsx"
-            else:
-                output_path = ml.TEMP_PATH / f"anomalias_export_{timestamp}.csv"
-                df.to_csv(output_path, index=False, encoding='utf-8-sig')
-                content_type = "text/csv"
-                filename = f"anomalias_{timestamp}.csv"
-            
-            return FileResponse(
-                path=output_path,
-                media_type=content_type,
-                filename=filename
-            )
-            
-    except Exception as e:
-        logger.error(f"Error exportando anomalías: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
+    
 # ## 9. ENDPOINTS DE MONITOREO Y SALUD
 
 # In[16]:
@@ -2370,14 +2130,16 @@ async def obtener_estadisticas_alertas(
             # Top países con más fraudes
             query_paises = f"""
             SELECT 
-                CODIGO_PAIS,
+                af.CODIGO_PAIS,
+                INITCAP(COALESCE(cp.DESCRIPCION_PAIS, 'País ' || af.CODIGO_PAIS)) as NOMBRE_PAIS,
                 COUNT(*) as CANTIDAD,
-                ROUND(AVG(SCORE_ANOMALIA), 4) as SCORE_PROMEDIO,
-                SUM(N_LLAMADAS) as TOTAL_LLAMADAS,
-                SUM(N_MINUTOS) as TOTAL_MINUTOS
-            FROM ALERTAS_FRAUDE
+                ROUND(AVG(af.SCORE_ANOMALIA), 4) as SCORE_PROMEDIO,
+                SUM(af.N_LLAMADAS) as TOTAL_LLAMADAS,
+                SUM(af.N_MINUTOS) as TOTAL_MINUTOS
+            FROM ALERTAS_FRAUDE af
+            LEFT JOIN CODIGO_PAISES cp ON af.CODIGO_PAIS = cp.CODIGO_PAIS
             {where_clause}
-            GROUP BY CODIGO_PAIS
+            GROUP BY af.CODIGO_PAIS, cp.DESCRIPCION_PAIS
             ORDER BY CANTIDAD DESC
             FETCH FIRST 10 ROWS ONLY
             """
@@ -2387,10 +2149,11 @@ async def obtener_estadisticas_alertas(
             for row in cursor:
                 top_paises.append({
                     "codigo_pais": row[0],
-                    "cantidad": row[1],
-                    "score_promedio": float(row[2]),
-                    "total_llamadas": row[3],
-                    "total_minutos": float(row[4])
+                    "nombre_pais": row[1],  # AGREGAR ESTA LÍNEA
+                    "cantidad": row[2],      # CAMBIAR ÍNDICES: era row[1] ahora row[2]
+                    "score_promedio": float(row[3]),  # era row[2] ahora row[3]
+                    "total_llamadas": row[4],  # era row[3] ahora row[4]
+                    "total_minutos": float(row[5])  # era row[4] ahora row[5]
                 })
             
             # Distribución por tipo de anomalía
