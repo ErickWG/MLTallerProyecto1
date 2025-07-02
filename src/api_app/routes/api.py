@@ -420,7 +420,7 @@ async def consultar_alertas(
                 params.append(fecha_fin)
 
             if codigo_pais:
-                query += " AND CODIGO_PAIS = :codigo_pais"
+                query += " AND af.CODIGO_PAIS = :codigo_pais"
                 params.append(codigo_pais)
 
             if tipo_anomalia:
