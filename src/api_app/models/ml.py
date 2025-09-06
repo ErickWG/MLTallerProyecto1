@@ -4,7 +4,7 @@ from pathlib import Path
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from .schemas import TipoAnomalia
+from .schemas import TipoAnomalia, Criticidad
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +105,20 @@ def crear_features_contextualizadas_mejorada(row, stats_pais_dict):
     return features
 
 
+def calcular_criticidad(score, umbral, llamadas, minutos, destinos):
+    ratio_score = max(score - umbral, 0) / umbral if umbral else 0
+    factor_llamadas = llamadas / 100
+    factor_minutos = minutos / 300
+    factor_destinos = destinos / 50
+    riesgo = 0.4 * ratio_score + 0.3 * factor_llamadas + 0.2 * factor_minutos + 0.1 * factor_destinos
+    if riesgo > 2.0:
+        return Criticidad.ALTA
+    elif riesgo > 1.0:
+        return Criticidad.MEDIA
+    else:
+        return Criticidad.BAJA
+
+
 def predecir_anomalia_individual(row_dict):
     """Realiza predicción para un registro individual"""
     if not modelo:
@@ -151,6 +165,7 @@ def predecir_anomalia_individual(row_dict):
         es_anomalia_final = False
         razon = "Score bajo umbral"
         tipo_anomalia = TipoAnomalia.NO_ANOMALIA
+    criticidad = calcular_criticidad(score, umbral_global, llamadas, minutos, destinos)
 
     if contexto_historico and pais in contexto_historico:
         tipo_contexto = contexto_historico[pais]
@@ -164,6 +179,7 @@ def predecir_anomalia_individual(row_dict):
         "umbral": umbral_global,
         "es_anomalia": es_anomalia_final,
         "tipo_anomalia": tipo_anomalia,
+        "criticidad": criticidad,
         "tipo_contexto": tipo_contexto,
         "razon_decision": razon,
     }

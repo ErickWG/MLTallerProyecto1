@@ -21,6 +21,7 @@ from ..models.schemas import (
     ConfiguracionUmbral,
     EstadoSistema,
     TipoAnomalia,
+    Criticidad,
 )
 from ..models import ml
 from ..database.oracle import (
@@ -80,6 +81,7 @@ async def scoring_individual(registro: RegistroTelefonico):
             umbral=round(resultado['umbral'], 4),
             es_anomalia=resultado['es_anomalia'],
             tipo_anomalia=resultado['tipo_anomalia'],
+            criticidad=resultado['criticidad'],
             tipo_contexto=resultado['tipo_contexto'],
             razon_decision=resultado['razon_decision'],
             timestamp_procesamiento=datetime.now()
@@ -212,6 +214,7 @@ def procesar_lote_sincrono(archivo_path: str, nombre_archivo: str, lote_id: int)
                 'umbral': round(resultado['umbral'], 4),
                 'es_anomalia': resultado['es_anomalia'],
                 'tipo_anomalia': resultado['tipo_anomalia'].value,
+                'criticidad': resultado['criticidad'].value,
                 'tipo_contexto': resultado['tipo_contexto'],
                 'razon_decision': resultado['razon_decision'],
                 'timestamp_procesamiento': datetime.now()
@@ -285,11 +288,11 @@ async def obtener_detalle_alerta(id_alerta: int):
             cursor = conn.cursor()
 
             cursor.execute("""
-                SELECT 
+                SELECT
                     af.ID_ALERTA, af.FECHA_PROCESAMIENTO, af.FECHA_REGISTRO, af.CODIGO_PAIS,
                     INITCAP(COALESCE(cp.DESCRIPCION_PAIS, 'País ' || af.CODIGO_PAIS)) as NOMBRE_PAIS,
                     af.LINEA, af.N_LLAMADAS, af.N_MINUTOS, af.N_DESTINOS, af.SCORE_ANOMALIA,
-                    af.UMBRAL, af.TIPO_ANOMALIA, af.TIPO_CONTEXTO, af.RAZON_DECISION,
+                    af.UMBRAL, af.TIPO_ANOMALIA, af.CRITICIDAD, af.TIPO_CONTEXTO, af.RAZON_DECISION,
                     af.ARCHIVO_ORIGEN, af.LOTE_PROCESAMIENTO
                 FROM ALERTAS_FRAUDE af
                 LEFT JOIN CODIGO_PAISES cp ON af.CODIGO_PAIS = cp.CODIGO_PAIS
@@ -343,10 +346,10 @@ async def descargar_archivo_lote(id_lote: int):
 
             # Obtener alertas del lote
             cursor.execute("""
-                SELECT 
-                    FECHA_REGISTRO, CODIGO_PAIS, LINEA, N_LLAMADAS, 
+                SELECT
+                    FECHA_REGISTRO, CODIGO_PAIS, LINEA, N_LLAMADAS,
                     N_MINUTOS, N_DESTINOS, SCORE_ANOMALIA, UMBRAL,
-                    TIPO_ANOMALIA, TIPO_CONTEXTO, RAZON_DECISION
+                    TIPO_ANOMALIA, CRITICIDAD, TIPO_CONTEXTO, RAZON_DECISION
                 FROM ALERTAS_FRAUDE
                 WHERE LOTE_PROCESAMIENTO = :lote_id
                 ORDER BY FECHA_PROCESAMIENTO
@@ -404,7 +407,7 @@ async def consultar_alertas(
                 SELECT af.ID_ALERTA, af.FECHA_PROCESAMIENTO, af.FECHA_REGISTRO, af.CODIGO_PAIS,
                     INITCAP(COALESCE(cp.DESCRIPCION_PAIS, 'País ' || af.CODIGO_PAIS)) as NOMBRE_PAIS,
                     af.LINEA, af.N_LLAMADAS, af.N_MINUTOS, af.N_DESTINOS, af.SCORE_ANOMALIA,
-                    af.UMBRAL, af.TIPO_ANOMALIA, af.TIPO_CONTEXTO, af.RAZON_DECISION
+                    af.UMBRAL, af.TIPO_ANOMALIA, af.CRITICIDAD, af.TIPO_CONTEXTO, af.RAZON_DECISION
                 FROM ALERTAS_FRAUDE af
                 LEFT JOIN CODIGO_PAISES cp ON af.CODIGO_PAIS = cp.CODIGO_PAIS
                 WHERE 1=1
@@ -2242,6 +2245,7 @@ async def exportar_anomalias(
                 SCORE_ANOMALIA,
                 UMBRAL,
                 TIPO_ANOMALIA,
+                CRITICIDAD,
                 TIPO_CONTEXTO,
                 RAZON_DECISION,
                 ARCHIVO_ORIGEN,
@@ -2314,12 +2318,13 @@ async def websocket_alertas(websocket: WebSocket):
             with oracle.get_oracle_connection() as conn:
                 cursor = conn.cursor()
                 query = """
-                SELECT 
+                SELECT
                     ID_ALERTA,
                     TO_CHAR(FECHA_PROCESAMIENTO, 'YYYY-MM-DD HH24:MI:SS') as FECHA,
                     CODIGO_PAIS,
                     LINEA,
                     TIPO_ANOMALIA,
+                    CRITICIDAD,
                     SCORE_ANOMALIA
                 FROM ALERTAS_FRAUDE
                 WHERE FECHA_PROCESAMIENTO >= SYSDATE - INTERVAL '1' MINUTE
@@ -2328,7 +2333,7 @@ async def websocket_alertas(websocket: WebSocket):
                 """
                 cursor.execute(query)
                 row = cursor.fetchone()
-                
+
                 if row:
                     alerta = {
                         "id": row[0],
@@ -2336,7 +2341,8 @@ async def websocket_alertas(websocket: WebSocket):
                         "codigo_pais": row[2],
                         "linea": row[3],
                         "tipo": row[4],
-                        "score": float(row[5]),
+                        "criticidad": row[5],
+                        "score": float(row[6]),
                         "timestamp": datetime.now().isoformat()
                     }
                     await websocket.send_json(alerta)

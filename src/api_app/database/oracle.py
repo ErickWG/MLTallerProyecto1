@@ -63,6 +63,7 @@ def crear_tablas_oracle():
             SCORE_ANOMALIA NUMBER(10,4),
             UMBRAL NUMBER(10,4),
             TIPO_ANOMALIA VARCHAR2(50),
+            CRITICIDAD VARCHAR2(20),
             TIPO_CONTEXTO VARCHAR2(50),
             RAZON_DECISION VARCHAR2(200),
             ARCHIVO_ORIGEN VARCHAR2(100),
@@ -170,6 +171,7 @@ def guardar_anomalias_oracle(anomalias_df, archivo_origen, lote_id):
                     float(row['score_anomalia']),
                     float(row['umbral']),
                     row['tipo_anomalia'],
+                    row['criticidad'],
                     row['tipo_contexto'],
                     row['razon_decision'],
                     archivo_origen,
@@ -179,9 +181,9 @@ def guardar_anomalias_oracle(anomalias_df, archivo_origen, lote_id):
         insert_sql = """
             INSERT INTO ALERTAS_FRAUDE (
                 FECHA_REGISTRO, CODIGO_PAIS, LINEA, N_LLAMADAS, N_MINUTOS,
-                N_DESTINOS, SCORE_ANOMALIA, UMBRAL, TIPO_ANOMALIA,
+                N_DESTINOS, SCORE_ANOMALIA, UMBRAL, TIPO_ANOMALIA, CRITICIDAD,
                 TIPO_CONTEXTO, RAZON_DECISION, ARCHIVO_ORIGEN, LOTE_PROCESAMIENTO
-            ) VALUES (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12, :13)
+            ) VALUES (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12, :13, :14)
         """
         cursor.executemany(insert_sql, datos_insertar)
         conn.commit()

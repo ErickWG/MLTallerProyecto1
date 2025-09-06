@@ -11,6 +11,13 @@ class TipoAnomalia(str, Enum):
     NO_ANOMALIA = "NO_ANOMALIA"
 
 
+class Criticidad(str, Enum):
+    BAJA = "BAJA"
+    MEDIA = "MEDIA"
+    ALTA = "ALTA"
+    CRITICA = "CRITICA"
+
+
 class RegistroTelefonico(BaseModel):
     fecha: str = Field(..., description="Fecha en formato DD/MM/YYYY")
     codigodepais: int = Field(..., description="Código del país como número entero")
@@ -31,6 +38,7 @@ class ResultadoScoring(BaseModel):
     umbral: float
     es_anomalia: bool
     tipo_anomalia: TipoAnomalia
+    criticidad: Criticidad
     tipo_contexto: str
     razon_decision: str
     timestamp_procesamiento: datetime
