@@ -135,30 +135,34 @@ def calcular_criticidad(
         divisor_destinos = stats.get("DESTINOS_P95", 50)
     else:
         divisor_llamadas = (
-            parametros_features.get("divisor_llamadas", 50)
-            if parametros_features
-            else 50
-        )
-        divisor_minutos = (
-            parametros_features.get("divisor_minutos", 100)
+            parametros_features.get("divisor_llamadas", 100)
             if parametros_features
             else 100
         )
-        divisor_destinos = (
-            parametros_features.get("divisor_destinos", 300)
+        divisor_minutos = (
+            parametros_features.get("divisor_minutos", 300)
             if parametros_features
             else 300
+        )
+        divisor_destinos = (
+            parametros_features.get("divisor_destinos", 50)
+            if parametros_features
+            else 50
         )
 
     factor_llamadas = llamadas / divisor_llamadas
     factor_minutos = minutos / divisor_minutos
     factor_destinos = destinos / divisor_destinos
 
+    # Prioritize N_DESTINOS over other factors, followed by N_LLAMADAS and
+    # finally minutes. The anomaly score still contributes but has less
+    # influence than before so that large destination counts can elevate the
+    # criticidad even when the score is close to the threshold.
     riesgo = (
-        0.4 * ratio_score
-        + 0.1 * factor_llamadas
-        + 0.2 * factor_minutos
-        + 0.3 * factor_destinos
+        0.2 * ratio_score
+        + 0.3 * factor_llamadas
+        + 0.1 * factor_minutos
+        + 0.4 * factor_destinos
     )
     if riesgo > 3.0:
         return Criticidad.CRITICA
