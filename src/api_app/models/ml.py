@@ -135,19 +135,19 @@ def calcular_criticidad(
         divisor_destinos = stats.get("DESTINOS_P95", 50)
     else:
         divisor_llamadas = (
-            parametros_features.get("divisor_llamadas", 100)
+            parametros_features.get("divisor_llamadas", 50)
+            if parametros_features
+            else 50
+        )
+        divisor_minutos = (
+            parametros_features.get("divisor_minutos", 100)
             if parametros_features
             else 100
         )
-        divisor_minutos = (
-            parametros_features.get("divisor_minutos", 300)
+        divisor_destinos = (
+            parametros_features.get("divisor_destinos", 300)
             if parametros_features
             else 300
-        )
-        divisor_destinos = (
-            parametros_features.get("divisor_destinos", 50)
-            if parametros_features
-            else 50
         )
 
     factor_llamadas = llamadas / divisor_llamadas
@@ -156,9 +156,9 @@ def calcular_criticidad(
 
     riesgo = (
         0.4 * ratio_score
-        + 0.3 * factor_llamadas
+        + 0.1 * factor_llamadas
         + 0.2 * factor_minutos
-        + 0.1 * factor_destinos
+        + 0.3 * factor_destinos
     )
     if riesgo > 3.0:
         return Criticidad.CRITICA
