@@ -389,6 +389,8 @@ async def consultar_alertas(
     fecha_inicio: Optional[str] = Query(None, description="Fecha inicio YYYY-MM-DD"),
     fecha_fin: Optional[str] = Query(None, description="Fecha fin YYYY-MM-DD"),
     codigo_pais: Optional[int] = Query(None, description="Código de país"),
+    linea: Optional[str] = Query(None, description="Número de línea"),
+    numero: Optional[str] = Query(None, description="Número de línea (alias)"),
     tipo_anomalia: Optional[str] = Query(None, description="Tipo de anomalía"),
     limite: int = Query(100, description="Número máximo de registros")
 ):
@@ -412,23 +414,28 @@ async def consultar_alertas(
                 LEFT JOIN CODIGO_PAISES cp ON af.CODIGO_PAIS = cp.CODIGO_PAIS
                 WHERE 1=1
             """
-            params = []
+            params = {}
 
             if fecha_inicio:
                 query += " AND FECHA_PROCESAMIENTO >= TO_DATE(:fecha_inicio, 'YYYY-MM-DD')"
-                params.append(fecha_inicio)
+                params["fecha_inicio"] = fecha_inicio
 
             if fecha_fin:
                 query += " AND FECHA_PROCESAMIENTO <= TO_DATE(:fecha_fin, 'YYYY-MM-DD') + 1"
-                params.append(fecha_fin)
+                params["fecha_fin"] = fecha_fin
 
             if codigo_pais:
                 query += " AND af.CODIGO_PAIS = :codigo_pais"
-                params.append(codigo_pais)
+                params["codigo_pais"] = codigo_pais
+
+            numero_linea = linea or numero
+            if numero_linea:
+                query += " AND af.LINEA = :linea"
+                params["linea"] = numero_linea
 
             if tipo_anomalia:
                 query += " AND TIPO_ANOMALIA = :tipo_anomalia"
-                params.append(tipo_anomalia)
+                params["tipo_anomalia"] = tipo_anomalia
 
             query += " ORDER BY FECHA_PROCESAMIENTO DESC"
             query += f" FETCH FIRST {limite} ROWS ONLY"
@@ -1736,6 +1743,31 @@ async def limpiar_archivos_antiguos(dias_retener: int = Query(7, description="D�
 # ## 10. ENDPOINTS DE INFORMACIÓN DE PAÍSES
 
 # In[17]:
+
+
+@router.get("/paises", tags=["Información"])
+async def obtener_paises():
+    """Obtiene la lista de países disponibles"""
+    if not oracle.oracle_pool:
+        raise HTTPException(status_code=503, detail="Oracle no disponible")
+
+    try:
+        with get_oracle_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT CODIGO_PAIS, INITCAP(DESCRIPCION_PAIS) AS NOMBRE_PAIS
+                FROM CODIGO_PAISES
+                ORDER BY DESCRIPCION_PAIS
+                """
+            )
+            paises = [
+                {"codigo_pais": row[0], "nombre_pais": row[1]} for row in cursor
+            ]
+            return {"total_paises": len(paises), "paises": paises}
+    except Exception as e:
+        logger.error(f"Error obteniendo países: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/paises/lista", tags=["Información"])
