@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from .database import oracle
 from .models import ml
 from .routes.api import router as api_router
+from .routes.auth import router as auth_router
 
 load_dotenv()
 
@@ -48,6 +49,7 @@ async def shutdown_event():
     logger.info("Apagando API...")
 
 
+app.include_router(auth_router)
 app.include_router(api_router)
 
 

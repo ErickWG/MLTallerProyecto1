@@ -70,3 +70,25 @@ class EstadoSistema(BaseModel):
     espacio_disco_gb: float
     version_api: str = "1.0"
 
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+
+class UserRegister(BaseModel):
+    username: str
+    password: str
+    role: str = "user"
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class User(BaseModel):
+    id: int
+    username: str
+    role: str
+
