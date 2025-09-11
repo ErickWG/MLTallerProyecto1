@@ -30,8 +30,8 @@ def test_calcular_criticidad_critica():
     result = ml.calcular_criticidad(6.0, 1.0, 300, 900, 150, pais=1)
     assert result == Criticidad.CRITICA
 
-
 def test_calcular_criticidad_critica_por_destinos():
     """High destination count should trigger CRITICA even with low score."""
     result = ml.calcular_criticidad(1.0, 1.0, 150, 200, 350, pais=1)
     assert result == Criticidad.CRITICA
+

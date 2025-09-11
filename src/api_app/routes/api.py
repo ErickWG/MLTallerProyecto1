@@ -389,11 +389,18 @@ async def consultar_alertas(
     fecha_inicio: Optional[str] = Query(None, description="Fecha inicio YYYY-MM-DD"),
     fecha_fin: Optional[str] = Query(None, description="Fecha fin YYYY-MM-DD"),
     codigo_pais: Optional[int] = Query(None, description="Código de país"),
+    linea: Optional[str] = Query(None, description="Número de línea"),
+    numero: Optional[str] = Query(None, description="Número de línea (alias)"),
     tipo_anomalia: Optional[str] = Query(None, description="Tipo de anomalía"),
-    limite: int = Query(100, description="Número máximo de registros")
+    limite: Optional[int] = Query(
+        None,
+        description="Número máximo de registros (si no se envía, trae TODOS)",
+        ge=1
+    )
 ):
     """
-    Consulta las alertas guardadas en Oracle con filtros opcionales
+    Consulta las alertas guardadas en Oracle con filtros opcionales.
+    Si `limite` es None, no se aplica límite.
     """
     if not oracle.oracle_pool:
         raise HTTPException(status_code=503, detail="Oracle no disponible")
@@ -401,57 +408,98 @@ async def consultar_alertas(
     try:
         with get_oracle_connection() as conn:
             cursor = conn.cursor()
+            cursor.arraysize = 1000  # opcional: mejora performance al iterar muchos registros
 
-            # Construir query dinámicamente - MODIFICAR ESTA SECCIÓN
             query = """
-                SELECT af.ID_ALERTA, af.FECHA_PROCESAMIENTO, af.FECHA_REGISTRO, af.CODIGO_PAIS,
-                    INITCAP(COALESCE(cp.DESCRIPCION_PAIS, 'País ' || af.CODIGO_PAIS)) as NOMBRE_PAIS,
-                    af.LINEA, af.N_LLAMADAS, af.N_MINUTOS, af.N_DESTINOS, af.SCORE_ANOMALIA,
-                    af.UMBRAL, af.TIPO_ANOMALIA, af.CRITICIDAD, af.TIPO_CONTEXTO, af.RAZON_DECISION
+                SELECT
+                    af.ID_ALERTA,
+                    af.FECHA_PROCESAMIENTO,
+                    af.FECHA_REGISTRO,
+                    af.CODIGO_PAIS,
+                    INITCAP(COALESCE(cp.DESCRIPCION_PAIS, 'País ' || af.CODIGO_PAIS)) AS NOMBRE_PAIS,
+                    af.LINEA,
+                    af.N_LLAMADAS,
+                    af.N_MINUTOS,
+                    af.N_DESTINOS,
+                    af.SCORE_ANOMALIA,
+                    af.UMBRAL,
+                    af.TIPO_ANOMALIA,
+                    af.CRITICIDAD,
+                    af.TIPO_CONTEXTO,
+                    af.RAZON_DECISION
                 FROM ALERTAS_FRAUDE af
                 LEFT JOIN CODIGO_PAISES cp ON af.CODIGO_PAIS = cp.CODIGO_PAIS
                 WHERE 1=1
             """
-            params = []
+            params = {}
 
             if fecha_inicio:
-                query += " AND FECHA_PROCESAMIENTO >= TO_DATE(:fecha_inicio, 'YYYY-MM-DD')"
-                params.append(fecha_inicio)
+                # Desde el inicio del día
+                query += " AND af.FECHA_PROCESAMIENTO >= TO_DATE(:fecha_inicio, 'YYYY-MM-DD')"
+                params["fecha_inicio"] = fecha_inicio
 
             if fecha_fin:
-                query += " AND FECHA_PROCESAMIENTO <= TO_DATE(:fecha_fin, 'YYYY-MM-DD') + 1"
-                params.append(fecha_fin)
+                # Hasta el fin del día (exclusivo +1 día)
+                query += " AND af.FECHA_PROCESAMIENTO < TO_DATE(:fecha_fin, 'YYYY-MM-DD') + 1"
+                params["fecha_fin"] = fecha_fin
 
-            if codigo_pais:
+            if codigo_pais is not None:
                 query += " AND af.CODIGO_PAIS = :codigo_pais"
-                params.append(codigo_pais)
+                params["codigo_pais"] = codigo_pais
+
+            numero_linea = linea or numero
+            if numero_linea:
+                query += " AND af.LINEA = :linea"
+                params["linea"] = numero_linea
 
             if tipo_anomalia:
-                query += " AND TIPO_ANOMALIA = :tipo_anomalia"
-                params.append(tipo_anomalia)
+                query += " AND af.TIPO_ANOMALIA = :tipo_anomalia"
+                params["tipo_anomalia"] = tipo_anomalia
 
-            query += " ORDER BY FECHA_PROCESAMIENTO DESC"
-            query += f" FETCH FIRST {limite} ROWS ONLY"
+            query += " ORDER BY af.FECHA_PROCESAMIENTO DESC"
+
+            # Aplica límite solo si el cliente lo envía
+            if limite is not None:
+                query += f" FETCH FIRST {int(limite)} ROWS ONLY"
 
             cursor.execute(query, params)
 
-            # Obtener nombres de columnas
             columnas = [col[0] for col in cursor.description]
 
-            # Convertir a lista de diccionarios
+            def to_str_iso_or_keep(v):
+                """
+                Si es datetime (tiene isoformat), devuélvelo como ISO-8601.
+                Si ya viene como str (cambios de NLS / cursor), lo dejamos tal cual
+                para no romper comportamientos previos.
+                """
+                if v is None:
+                    return None
+                # objetos datetime de cx_Oracle tienen .isoformat()
+                if hasattr(v, "isoformat"):
+                    try:
+                        return v.isoformat()
+                    except Exception:
+                        # por si llega algo raro con isoformat, devolvemos str
+                        return str(v)
+                # si ya es string u otro tipo simple
+                return str(v)
+
             alertas = []
             for row in cursor:
-                alerta = dict(zip(columnas, row))
-                # Convertir datetime a string
-                if alerta['FECHA_PROCESAMIENTO']:
-                    alerta['FECHA_PROCESAMIENTO'] = alerta['FECHA_PROCESAMIENTO'].isoformat()
-                alertas.append(alerta)
+                item = dict(zip(columnas, row))
+                # Normalizar fechas de forma segura (sin romper si ya vienen como str)
+                item["FECHA_PROCESAMIENTO"] = to_str_iso_or_keep(item.get("FECHA_PROCESAMIENTO"))
+                item["FECHA_REGISTRO"] = to_str_iso_or_keep(item.get("FECHA_REGISTRO"))
+                alertas.append(item)
 
             return {
                 "total": len(alertas),
                 "alertas": alertas
             }
 
+    except HTTPException:
+        # re-lanza HTTPExceptions tal cual
+        raise
     except Exception as e:
         logger.error(f"Error consultando alertas: {e}")
         raise HTTPException(status_code=500, detail=str(e))
