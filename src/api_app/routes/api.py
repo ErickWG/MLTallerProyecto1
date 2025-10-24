@@ -392,6 +392,7 @@ async def consultar_alertas(
     linea: Optional[str] = Query(None, description="Número de línea"),
     numero: Optional[str] = Query(None, description="Número de línea (alias)"),
     tipo_anomalia: Optional[str] = Query(None, description="Tipo de anomalía"),
+    criticidad: Optional[str] = Query(None, description="Nivel de criticidad"),
     limite: Optional[int] = Query(
         None,
         description="Número máximo de registros (si no se envía, trae TODOS)",
@@ -455,6 +456,10 @@ async def consultar_alertas(
             if tipo_anomalia:
                 query += " AND af.TIPO_ANOMALIA = :tipo_anomalia"
                 params["tipo_anomalia"] = tipo_anomalia
+
+            if criticidad:
+                query += " AND af.CRITICIDAD = :criticidad"
+                params["criticidad"] = criticidad
 
             query += " ORDER BY af.FECHA_PROCESAMIENTO DESC"
 
@@ -1783,7 +1788,29 @@ async def limpiar_archivos_antiguos(dias_retener: int = Query(7, description="D�
 
 # ## 10. ENDPOINTS DE INFORMACIÓN DE PAÍSES
 
-# In[17]:
+@router.get("/paises", tags=["Información"])
+async def obtener_paises():
+    """Obtiene la lista de países disponibles"""
+    if not oracle.oracle_pool:
+        raise HTTPException(status_code=503, detail="Oracle no disponible")
+
+    try:
+        with get_oracle_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT CODIGO_PAIS, INITCAP(DESCRIPCION_PAIS) AS NOMBRE_PAIS
+                FROM CODIGO_PAISES
+                ORDER BY DESCRIPCION_PAIS
+                """
+            )
+            paises = [
+                {"codigo_pais": row[0], "nombre_pais": row[1]} for row in cursor
+            ]
+            return {"total_paises": len(paises), "paises": paises}
+    except Exception as e:
+        logger.error(f"Error obteniendo países: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/paises/lista", tags=["Información"])
