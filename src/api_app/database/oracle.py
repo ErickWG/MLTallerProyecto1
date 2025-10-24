@@ -3,14 +3,17 @@ import logging
 import oracledb
 from contextlib import contextmanager
 from datetime import datetime
+from dotenv import load_dotenv  # 👈 importar dotenv
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 # Configuración de Oracle obtenida desde variables de entorno
 ORACLE_CONFIG = {
-    "user": "SYSTEM",
-    "password": "erick710132",
-    "dsn": "localhost:1521/xe",
+    "user": os.getenv("ORACLE_USER"),
+    "password": os.getenv("ORACLE_PASSWORD"),
+    "dsn": os.getenv("ORACLE_DSN"),
 }
 
 oracle_pool = None
