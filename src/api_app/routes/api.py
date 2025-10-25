@@ -2484,3 +2484,340 @@ async def obtener_metricas_tiempo_real():
 
 # ## 11. CONFIGURACIÓN PARA EJECUTAR LA API
 
+# Agregar este código en tu archivo de rutas (después del endpoint de actualizacion-diaria)
+
+# Variable global para señalizar cancelación
+cancelacion_activa = False
+
+@router.post("/modelo/actualizacion-diaria/cancelar", tags=["Modelo"])
+async def cancelar_actualizacion_diaria():
+    """
+    Cancela la actualización diaria en proceso
+    """
+    global cancelacion_activa
+    
+    if not oracle.oracle_pool:
+        raise HTTPException(status_code=503, detail="Oracle no disponible")
+    
+    try:
+        # Activar flag de cancelación
+        cancelacion_activa = True
+        
+        # Actualizar estado en BD
+        with get_oracle_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Buscar actualización EN_PROCESO más reciente
+            cursor.execute("""
+                SELECT ID_ACTUALIZACION 
+                FROM ACTUALIZACION_DIARIA_UMBRAL
+                WHERE ESTADO = 'EN_PROCESO'
+                AND FECHA_EJECUCION >= SYSDATE - 1
+                ORDER BY FECHA_EJECUCION DESC
+                FETCH FIRST 1 ROW ONLY
+            """)
+            
+            row = cursor.fetchone()
+            
+            if row:
+                id_actualizacion = row[0]
+                
+                # Marcar como CANCELADO
+                cursor.execute("""
+                    UPDATE ACTUALIZACION_DIARIA_UMBRAL
+                    SET ESTADO = 'CANCELADO',
+                        MENSAJE_ERROR = 'Cancelado por el usuario',
+                        TIEMPO_PROCESAMIENTO_SEG = EXTRACT(SECOND FROM (SYSTIMESTAMP - FECHA_EJECUCION))
+                    WHERE ID_ACTUALIZACION = :id
+                """, [id_actualizacion])
+                
+                conn.commit()
+                
+                logger.info(f"Actualización {id_actualizacion} cancelada exitosamente")
+                
+                return {
+                    "mensaje": "Actualización cancelada exitosamente",
+                    "id_actualizacion": id_actualizacion,
+                    "timestamp": datetime.now().isoformat()
+                }
+            else:
+                return {
+                    "mensaje": "No hay actualizaciones en proceso para cancelar",
+                    "timestamp": datetime.now().isoformat()
+                }
+                
+    except Exception as e:
+        logger.error(f"Error cancelando actualización: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Modificar la función procesar_actualizacion_diaria_sincrono_v2 para verificar cancelación
+def procesar_actualizacion_diaria_sincrono_v2(archivo_path: str, df: pd.DataFrame):
+    """
+    Versión síncrona V2 con soporte para cancelación
+    """
+    global cancelacion_activa
+    
+    # RESETEAR flag al iniciar
+    cancelacion_activa = False
+    
+    tiempo_inicio = datetime.now()
+    id_actualizacion = None
+    estado_inicial = {
+        'umbral': ml.umbral_global,
+        'n_trees': ml.config.get('n_trees', 0),
+        'paises_conocidos': len(ml.stats_dict)
+    }
+    
+    try:
+        total_registros = len(df)
+        logger.info(f"Iniciando actualización diaria asíncrona con {total_registros} registros")
+        
+        # Registrar inicio en Oracle
+        if oracle.oracle_pool:
+            id_actualizacion = registrar_inicio_actualizacion_diaria(
+                archivo_path, total_registros, estado_inicial
+            )
+        
+        scores_dia = []
+        scores_por_tipo = {
+            'normales': [],
+            'minutos_extremos': [],
+            'spray_calling': [],
+            'volumen_alto': [],
+            'pais_bajo': []
+        }
+        
+        batch_size = 1000
+        registros_procesados = 0
+        
+        for start_idx in range(0, total_registros, batch_size):
+            # ⚠️ VERIFICAR CANCELACIÓN AL INICIO DE CADA LOTE
+            if cancelacion_activa:
+                logger.warning(f"⚠️ Cancelación detectada en registro {registros_procesados}")
+                raise Exception("Actualización cancelada por el usuario")
+            
+            end_idx = min(start_idx + batch_size, total_registros)
+            batch_df = df.iloc[start_idx:end_idx]
+            
+            progreso_porcentaje = (end_idx / total_registros) * 100
+            
+            logger.info(f"Procesando lote {start_idx}-{end_idx} de {total_registros}")
+            
+            for idx, row in batch_df.iterrows():
+                # ⚠️ VERIFICAR CANCELACIÓN CADA 100 REGISTROS
+                if registros_procesados % 100 == 0 and cancelacion_activa:
+                    logger.warning(f"⚠️ Cancelación detectada en registro {registros_procesados}")
+                    raise Exception("Actualización cancelada por el usuario")
+                
+                if pd.isna(row.get('CODIGODEPAIS')):
+                    continue
+                    
+                try:
+                    row_dict = {
+                        'CODIGODEPAIS': int(row['CODIGODEPAIS']),
+                        'N_LLAMADAS': row['N_LLAMADAS'],
+                        'N_MINUTOS': row['N_MINUTOS'],
+                        'N_DESTINOS': row['N_DESTINOS']
+                    }
+                    
+                    features = ml.crear_features_contextualizadas_mejorada(row_dict, ml.stats_dict)
+                    features_scaled = ml.scaler.transform_one(features)
+                    score = ml.modelo.score_one(features_scaled)
+                    scores_dia.append(score)
+                    registros_procesados += 1
+                    
+                    # Clasificar por tipo
+                    pais = row_dict['CODIGODEPAIS']
+                    minutos = row_dict['N_MINUTOS']
+                    llamadas = row_dict['N_LLAMADAS']
+                    destinos = row_dict['N_DESTINOS']
+                    
+                    if minutos >= ml.parametros_features['umbral_minutos_extremos']:
+                        scores_por_tipo['minutos_extremos'].append(score)
+                    elif destinos >= 6 and llamadas >= 12:
+                        scores_por_tipo['spray_calling'].append(score)
+                    elif llamadas > 50 or destinos > 15:
+                        scores_por_tipo['volumen_alto'].append(score)
+                    elif pais not in ml.stats_dict or ml.stats_dict.get(pais, {}).get('CATEGORIA') in ['Muy_Bajo', 'Bajo']:
+                        scores_por_tipo['pais_bajo'].append(score)
+                    else:
+                        scores_por_tipo['normales'].append(score)
+                        
+                except Exception as e:
+                    logger.warning(f"Error procesando fila {idx}: {e}")
+                    continue
+            
+            # ACTUALIZAR PROGRESO EN BD CADA LOTE
+            if oracle.oracle_pool and id_actualizacion:
+                try:
+                    actualizar_progreso_actualizacion_diaria(
+                        id_actualizacion, 
+                        registros_procesados, 
+                        progreso_porcentaje
+                    )
+                except Exception as e:
+                    logger.warning(f"Error actualizando progreso: {e}")
+        
+        # Resto del código igual (calcular umbral, actualizar config, etc.)
+        # ... (mantener todo el código original después del procesamiento)
+        
+        if not scores_dia:
+            raise ValueError("No se pudieron procesar registros válidos")
+        
+        logger.info(f"Procesados {len(scores_dia)} registros con scores válidos")
+        
+        # ANÁLISIS ESTADÍSTICO DE SCORES
+        analisis_scores = {
+            'media': np.mean(scores_dia),
+            'mediana': np.median(scores_dia),
+            'std': np.std(scores_dia),
+            'p90': np.percentile(scores_dia, 90),
+            'p95': np.percentile(scores_dia, 95),
+            'p99': np.percentile(scores_dia, 99),
+            'min': np.min(scores_dia),
+            'max': np.max(scores_dia)
+        }
+        
+        # CALCULAR NUEVO UMBRAL
+        umbral_estadistico = analisis_scores['p95']
+        
+        if len(scores_por_tipo['normales']) > 0:
+            umbral_separacion = np.percentile(scores_por_tipo['normales'], 99)
+        else:
+            umbral_separacion = umbral_estadistico
+        
+        umbral_candidato = min(umbral_estadistico, umbral_separacion)
+        cambio_maximo = ml.umbral_global * 0.1
+        
+        if umbral_candidato > ml.umbral_global + cambio_maximo:
+            umbral_nuevo = ml.umbral_global + cambio_maximo
+            razon_cambio = "Incremento limitado al 10%"
+        elif umbral_candidato < ml.umbral_global - cambio_maximo:
+            umbral_nuevo = ml.umbral_global - cambio_maximo
+            razon_cambio = "Decremento limitado al 10%"
+        else:
+            umbral_nuevo = umbral_candidato
+            razon_cambio = "Ajuste dentro del rango permitido"
+        
+        # ACTUALIZAR ESTADÍSTICAS POR PAÍS
+        estadisticas_dia = {}
+        paises_unicos = df['CODIGODEPAIS'].dropna().unique()
+        
+        for pais in paises_unicos:
+            try:
+                pais = int(pais)
+                datos_pais = df[df['CODIGODEPAIS'] == pais]
+                
+                estadisticas_dia[pais] = {
+                    'registros': len(datos_pais),
+                    'llamadas_mean': float(datos_pais['N_LLAMADAS'].mean()),
+                    'minutos_mean': float(datos_pais['N_MINUTOS'].mean()),
+                    'destinos_mean': float(datos_pais['N_DESTINOS'].mean()),
+                    'llamadas_max': int(datos_pais['N_LLAMADAS'].max()),
+                    'minutos_max': float(datos_pais['N_MINUTOS'].max()),
+                    'destinos_max': int(datos_pais['N_DESTINOS'].max())
+                }
+            except Exception as e:
+                logger.warning(f"Error procesando estadísticas del país {pais}: {e}")
+                continue
+        
+        # ACTUALIZAR CONFIGURACIÓN
+        umbral_anterior = ml.umbral_global
+        ml.umbral_global = umbral_nuevo
+        ml.config['umbral_global'] = ml.umbral_global
+        ml.config['fecha_ultima_actualizacion'] = datetime.now().isoformat()
+        ml.config['ultima_actualizacion_diaria'] = {
+            'fecha': datetime.now().isoformat(),
+            'registros_analizados': len(df),
+            'umbral_anterior': umbral_anterior,
+            'umbral_nuevo': umbral_nuevo,
+            'cambio_porcentual': ((umbral_nuevo - umbral_anterior) / umbral_anterior * 100),
+            'razon_cambio': razon_cambio,
+            'analisis_scores': analisis_scores,
+            'estadisticas_dia': estadisticas_dia
+        }
+        
+        # Guardar configuración
+        try:
+            with open(ml.MODELS_PATH / "config_modelo_general.pkl", 'wb') as f:
+                pickle.dump(ml.config, f)
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = ml.MODELS_PATH / f"backup_config_diaria_{timestamp}.pkl"
+            with open(backup_path, 'wb') as f:
+                pickle.dump(ml.config, f)
+                
+        except Exception as e:
+            logger.error(f"Error guardando configuración: {e}")
+        
+        # Calcular tiempo
+        tiempo_fin = datetime.now()
+        tiempo_procesamiento = (tiempo_fin - tiempo_inicio).total_seconds()
+        
+        # Actualizar Oracle
+        if oracle.oracle_pool and id_actualizacion:
+            try:
+                actualizar_fin_actualizacion_diaria(
+                    id_actualizacion=id_actualizacion,
+                    registros_analizados=len(df),
+                    umbral_nuevo=umbral_nuevo,
+                    tiempo_procesamiento=tiempo_procesamiento,
+                    estado="COMPLETADO",
+                    backup_path=str(backup_path) if 'backup_path' in locals() else '',
+                    razon_cambio=razon_cambio
+                )
+            except Exception as e:
+                logger.error(f"Error actualizando Oracle: {e}")
+        
+        # Limpiar archivo
+        if os.path.exists(archivo_path):
+            os.remove(archivo_path)
+        
+        logger.info(f"""
+        Actualización diaria completada:
+        - Registros analizados: {len(df)}
+        - Umbral anterior: {umbral_anterior:.4f}
+        - Umbral nuevo: {umbral_nuevo:.4f}
+        - Cambio: {((umbral_nuevo - umbral_anterior) / umbral_anterior * 100):.2f}%
+        - Tiempo: {tiempo_procesamiento:.2f} segundos
+        """)
+        
+        return {
+            'registros_analizados': len(df),
+            'scores_calculados': len(scores_dia),
+            'umbral_anterior': umbral_anterior,
+            'umbral_nuevo': umbral_nuevo,
+            'cambio_porcentual': ((umbral_nuevo - umbral_anterior) / umbral_anterior * 100),
+            'razon_cambio': razon_cambio,
+            'tiempo_procesamiento': tiempo_procesamiento,
+            'paises_procesados': len(estadisticas_dia)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error en actualización diaria: {str(e)}")
+        
+        # Actualizar registro de error en Oracle
+        if oracle.oracle_pool and id_actualizacion:
+            try:
+                with get_oracle_connection() as conn:
+                    cursor = conn.cursor()
+                    
+                    # Determinar si fue cancelación o error
+                    estado_final = 'CANCELADO' if 'cancelada' in str(e).lower() else 'ERROR'
+                    
+                    cursor.execute("""
+                        UPDATE ACTUALIZACION_DIARIA_UMBRAL
+                        SET ESTADO = :1,
+                            MENSAJE_ERROR = :2,
+                            TIEMPO_PROCESAMIENTO_SEG = :3
+                        WHERE ID_ACTUALIZACION = :4
+                    """, [estado_final, str(e), (datetime.now() - tiempo_inicio).total_seconds(), id_actualizacion])
+                    conn.commit()
+            except Exception as oracle_error:
+                logger.error(f"Error actualizando Oracle con error: {oracle_error}")
+        
+        if os.path.exists(archivo_path):
+            os.remove(archivo_path)
+        
+        raise e
